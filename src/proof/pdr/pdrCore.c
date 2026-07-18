@@ -22,6 +22,7 @@
 #include "base/main/main.h"
 #include "misc/hash/hash.h"
 #include "ext-multiTimeframePDR/pdrProofObligationTreeLogger.h"
+#include "ext-multiTimeframePDR/pdrMultiTimeframe.h"
 
 ABC_NAMESPACE_IMPL_START
 
@@ -1255,6 +1256,13 @@ int Pdr_ManBlockCube( Pdr_Man_t * p, Pdr_Set_t * pCube )
     int i, k, RetValue, Prio = ABC_INFINITY, Counter = 0;
     int kMax = Vec_PtrSize(p->vSolvers)-1;
     abctime clk;
+
+    // Use multi-timeframe PDR if enabled
+    if ( use_multi_timeframe )
+    {
+        return PdrMultiTimeframe_ManBlockCube( p, pCube );
+    }
+
     p->nBlocks++;
     // create first proof obligation
 //    assert( p->pQueue == NULL );

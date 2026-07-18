@@ -10,7 +10,6 @@
 #include <iomanip>
 #include <sstream>
 #include <vector>
-#include <queue>
 
 class StatisticsCollector {
 private:
@@ -163,6 +162,100 @@ public:
                      << std::setw(7) << percentage << "%" << std::endl;
         }
         std::cout << "=======================\n" << std::endl;
+    }
+};
+
+// Median calculator using sorted vector.
+// Optimized for small n where cache locality matters.
+// Complexity: add O(n), median O(1), remove O(n)
+class MedianCalculator {
+private:
+    std::vector<double> data;
+
+public:
+    MedianCalculator() {}
+
+    void add(double value) {
+        auto pos = std::lower_bound(data.begin(), data.end(), value);
+        data.insert(pos, value);
+    }
+
+    // For even count, returns lower median
+    double get_median() const {
+        assert(!data.empty() && "No data points available");
+        size_t mid = (data.size() - 1) / 2;
+        return data[mid];
+    }
+
+    size_t get_count() const {
+        return data.size();
+    }
+
+    bool is_empty() const {
+        return data.empty();
+    }
+
+    void remove_largest(size_t num) {
+        if (num >= data.size()) {
+            data.clear();
+        } else {
+            data.resize(data.size() - num);
+        }
+    }
+
+    void remove_smallest(size_t num) {
+        if (num >= data.size()) {
+            data.clear();
+        } else {
+            data.erase(data.begin(), data.begin() + num);
+        }
+    }
+
+    void reset() {
+        data.clear();
+    }
+};
+
+// Bounded median calculator with automatic outlier removal.
+// When count exceeds max_size, removes outliers from both ends.
+class BoundedMedianCalculator {
+private:
+    MedianCalculator inner;
+    size_t max_size;
+    size_t remove_per_side;
+
+public:
+    // max_size=100, removal_ratio=0.2 -> removes 10 largest + 10 smallest when full
+    BoundedMedianCalculator(size_t max_size = 100, double removal_ratio = 0.2)
+        : max_size(max_size) {
+        assert(max_size > 0);
+        assert(removal_ratio >= 0.0 && removal_ratio < 1.0);
+        size_t total_remove = static_cast<size_t>(max_size * removal_ratio);
+        remove_per_side = total_remove / 2;
+    }
+
+    void add_value(double value) {
+        if (inner.get_count() >= max_size) {
+            inner.remove_largest(remove_per_side);
+            inner.remove_smallest(remove_per_side);
+        }
+        inner.add(value);
+    }
+
+    double get_median() const {
+        return inner.get_median();
+    }
+
+    size_t get_count() const {
+        return inner.get_count();
+    }
+
+    bool is_empty() const {
+        return inner.is_empty();
+    }
+
+    void reset() {
+        inner.reset();
     }
 };
 

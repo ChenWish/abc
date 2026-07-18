@@ -21,6 +21,7 @@
 #include "pdrInt.h"
 #include "sat/bmc/bmc.h"
 #include "ext-multiTimeframePDR/pdrProofObligationTreeLogger.h"
+#include "ext-multiTimeframePDR/pdrMultiTimeframe.h"
 
 ABC_NAMESPACE_IMPL_START
 
@@ -258,8 +259,14 @@ Pdr_Man_t * Pdr_ManStart( Aig_Man_t * pAig, Pdr_Par_t * pPars, Vec_Int_t * vPrio
     p->pQueue   = NULL;
     p->pOrder   = ABC_ALLOC( int, Aig_ManRegNum(pAig) );
     p->vActVars = Vec_IntAlloc( 256 );
-    if ( !p->pPars->fMonoCnf )
-        p->vVLits   = Vec_WecStart( 1+Abc_MaxInt(1, Aig_ManLevels(pAig)) );
+    if ( use_multi_timeframe )
+        PdrMultiTimeframe_OnRunStart();
+    if ( !p->pPars->fMonoCnf ) {
+        if ( !use_multi_timeframe )
+            p->vVLits = Vec_WecStart( 1+Abc_MaxInt(1, Aig_ManLevels(pAig)) );
+        else // the multi-timeframe CNF loader recurses over up to 80 unrolled frames
+            p->vVLits = Vec_WecStart( (1+Abc_MaxInt(1, Aig_ManLevels(pAig))) * 80 );
+    }
     // internal use
     p->nPrioShift = Abc_Base2Log(Aig_ManRegNum(pAig));
     if ( vPrioInit )
@@ -411,6 +418,11 @@ void Pdr_ManStop( Pdr_Man_t * p )
 ***********************************************************************/
 Abc_Cex_t * Pdr_ManDeriveCex( Pdr_Man_t * p )
 {
+    // Use multi-timeframe CEX derivation if enabled
+    if ( use_multi_timeframe ) {
+        return PdrMultiTimeframe_ManDeriveCex( p, p->pQueue );
+    }
+
     Abc_Cex_t * pCex;
     Pdr_Obl_t * pObl;
     int i, f, Lit, nFrames = 0;
