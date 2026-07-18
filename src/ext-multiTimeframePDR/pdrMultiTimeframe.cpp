@@ -16,6 +16,7 @@
 
 #include "proof/pdr/pdrInt.h"
 #include "StatisticsCollector.h"
+#include "pdrProofObligationTreeLogger.h"  // runtime-guarded by use_proof_obligation_tree_logging
 #include "pdrMultiTimeframe.h"
 
 #include <iostream>
@@ -1114,7 +1115,9 @@ static int PdrMultiTimeframe_ManBlockCube_for_first_level(Pdr_Man_t *p, Pdr_Obl_
 
     int i, k, RetValue;
 
+    const abctime start_time = Abc_Clock();
     RetValue = PdrMultiTimeframe_ManGeneralize(p, pThis->pState, solving_data, &pPred, &pCubeMin);
+    Pdr_AddSolvingTime(pThis->pState, Abc_Clock() - start_time);
 
     if (RetValue == -1) {
         Pdr_OblDeref(pThis);
@@ -1162,10 +1165,14 @@ static int PdrMultiTimeframe_ManBlockCube_for_first_level(Pdr_Man_t *p, Pdr_Obl_
         for (i = 1; i <= k; i++)
             Pdr_ManSolverAddClause(p, i, pCubeMin);
 
+        Pdr_ProofObligationTree_RemoveProofObligation(pThis);
         Pdr_OblDeref(pThis);
     } else {
         assert(pCubeMin == NULL);
         assert(pPred != NULL);
+
+        // child spans timeframe_expansion frames, not 1
+        Pdr_ProofObligationTree_AddChild(pThis->pState, pPred, solving_data.timeframe_expansion);
 
         pThis->prio = Prio--;
         Pdr_QueuePush(p, pThis);
@@ -1207,6 +1214,8 @@ extern "C" int PdrMultiTimeframe_ManBlockCube(Pdr_Man_t *p, Pdr_Set_t *pCube) {
     pThis = Pdr_OblStart(kMax, Prio--, pCube, NULL);
     Pdr_QueuePush(p, pThis);
 
+    Pdr_ProofObligationTree_AddRootNode(pCube, pThis->iFrame, 0, 1);
+
     while (!Pdr_QueueIsEmpty(p)) {
         Counter++;
         pThis = Pdr_QueueHead(p);
@@ -1231,12 +1240,16 @@ extern "C" int PdrMultiTimeframe_ManBlockCube(Pdr_Man_t *p, Pdr_Set_t *pCube) {
             assert(timeframe_expansion_for_first_level <= multiTimeframe::L);
 
             block_cube_start_clk = Abc_Clock();
+            // restart() cleans the queue; Pdr_QueueClean closes out the whole logger
+            // tree (child-to-parent) and prints every root with is_restart: true
             multi_timeframe_manager.restart(block_cube_start_clk, p);
+            assert(Pdr_ProofObligationTree_LevelFinishedCheck());
             Prio = ABC_INFINITY;
             pCube = multi_timeframe_manager.pCube;
             Pdr_SetRef(pCube);
             pThis = Pdr_OblStart(kMax, Prio--, pCube, NULL);
             Pdr_QueuePush(p, pThis);
+            Pdr_ProofObligationTree_AddRootNode(pCube, pThis->iFrame, 0, 1);
             continue;
         }
 
@@ -1249,6 +1262,7 @@ extern "C" int PdrMultiTimeframe_ManBlockCube(Pdr_Man_t *p, Pdr_Set_t *pCube) {
         
         if (Pdr_ManCheckContainment(p, pThis->iFrame, pThis->pState)) {
             p->tContain += Abc_Clock() - clk;
+            Pdr_ProofObligationTree_RemoveProofObligation(pThis);
             Pdr_OblDeref(pThis);
             continue;
         }
@@ -1260,6 +1274,7 @@ extern "C" int PdrMultiTimeframe_ManBlockCube(Pdr_Man_t *p, Pdr_Set_t *pCube) {
             return -1;
         }
         if (RetValue) {
+            Pdr_ProofObligationTree_RemoveProofObligation(pThis);
             Pdr_OblDeref(pThis);
             continue;
         }
@@ -1278,7 +1293,9 @@ extern "C" int PdrMultiTimeframe_ManBlockCube(Pdr_Man_t *p, Pdr_Set_t *pCube) {
 
         // Standard PDR generalization
         pCubeMin = NULL;
+        const abctime generalize_start_time = Abc_Clock();
         RetValue = Pdr_ManGeneralize(p, pThis->iFrame-1, pThis->pState, &pPred, &pCubeMin);
+        Pdr_AddSolvingTime(pThis->pState, Abc_Clock() - generalize_start_time);
 
         if (RetValue == -1) {
             Pdr_OblDeref(pThis);
@@ -1313,17 +1330,22 @@ extern "C" int PdrMultiTimeframe_ManBlockCube(Pdr_Man_t *p, Pdr_Set_t *pCube) {
             for (i = 1; i <= k; i++)
                 Pdr_ManSolverAddClause(p, i, pCubeMin);
 
+            Pdr_ProofObligationTree_RemoveProofObligation(pThis);
+
             // Schedule promoted root
             if ((k < kMax || p->pPars->fReuseProofOblig) && !p->pPars->fShortest) {
                 pThis->iFrame = k+1;
                 pThis->prio = Prio--;
                 Pdr_QueuePush(p, pThis);
+                Pdr_ProofObligationTree_AddRootNode(pThis->pState, pThis->iFrame, 1, pThis->pNext == NULL);
             } else {
                 Pdr_OblDeref(pThis);
             }
         } else {
             assert(pCubeMin == NULL);
             assert(pPred != NULL);
+
+            Pdr_ProofObligationTree_AddChild(pThis->pState, pPred, 1);
 
             pThis->prio = Prio--;
             Pdr_QueuePush(p, pThis);
@@ -1342,6 +1364,7 @@ extern "C" int PdrMultiTimeframe_ManBlockCube(Pdr_Man_t *p, Pdr_Set_t *pCube) {
             return -1;
     }
 
+    assert(Pdr_ProofObligationTree_LevelFinishedCheck());
     double solving_time_for_block_cube = abctime_to_seconds(Abc_Clock() - block_cube_start_clk);
     multi_timeframe_manager.add_solving_time(solving_time_for_block_cube);
     multi_timeframe_manager.reset();
