@@ -32568,15 +32568,17 @@ int Abc_CommandPdr( Abc_Frame_t * pAbc, int argc, char ** argv )
     extern int Abc_NtkDarPdr( Abc_Ntk_t * pNtk, Pdr_Par_t * pPars );
     extern int use_multi_timeframe;
     extern int use_proof_obligation_tree_logging;
+    extern int mtf_fixed_timeframe_expansion;
     Pdr_Par_t Pars, * pPars = &Pars;
     Abc_Ntk_t * pNtk = Abc_FrameReadNtk(pAbc), * pNtkUsed, * pNtkFlop = NULL;
     char * pLogFileName = NULL;
     int c;
     int fMultiTimeframe = 0;
     int fPotLogging = 0;
+    int nFixedTimeframeExpansion = -1;
     Pdr_ManSetDefaultParams( pPars );
     Extra_UtilGetoptReset();
-    while ( ( c = Extra_UtilGetopt( argc, argv, "MFCDQTHGSLIaxrmuyfqipdegjonctkvwzhbsl" ) ) != EOF )
+    while ( ( c = Extra_UtilGetopt( argc, argv, "MFCDQTHGSELIaxrmuyfqipdegjonctkvwzhbsl" ) ) != EOF )
     {
         switch ( c )
         {
@@ -32679,6 +32681,17 @@ int Abc_CommandPdr( Abc_Frame_t * pAbc, int argc, char ** argv )
             if ( pPars->nRandomSeed < 0 )
                 goto usage;
             break;
+        case 'E':
+            if ( globalUtilOptind >= argc )
+            {
+                Abc_Print( -1, "Command line switch \"-E\" should be followed by an integer.\n" );
+                goto usage;
+            }
+            nFixedTimeframeExpansion = atoi(argv[globalUtilOptind]);
+            globalUtilOptind++;
+            if ( nFixedTimeframeExpansion < 2 )
+                goto usage;
+            break;
         case 'L':
             if ( globalUtilOptind >= argc )
             {
@@ -32777,6 +32790,11 @@ int Abc_CommandPdr( Abc_Frame_t * pAbc, int argc, char ** argv )
             goto usage;
         }
     }
+    if ( nFixedTimeframeExpansion != -1 && !fMultiTimeframe )
+    {
+        Abc_Print( -1, "Switch \"-E\" requires multi-timeframe PDR (combine with \"-s\").\n" );
+        return 1;
+    }
     if ( pNtk == NULL )
     {
         Abc_Print( -2, "There is no current network.\n");
@@ -32802,6 +32820,7 @@ int Abc_CommandPdr( Abc_Frame_t * pAbc, int argc, char ** argv )
     pNtkUsed = pNtkFlop ? pNtkFlop : pNtk;
     use_multi_timeframe = fMultiTimeframe;
     use_proof_obligation_tree_logging = fPotLogging;
+    mtf_fixed_timeframe_expansion = nFixedTimeframeExpansion;
     pAbc->Status  = Abc_NtkDarPdr( pNtkUsed, pPars );
     pAbc->nFrames = pNtkUsed->vSeqModelVec ? -1 : pPars->iFrame;
     Abc_FrameReplacePoStatuses( pAbc, &pPars->vOutMap );
@@ -32815,7 +32834,7 @@ int Abc_CommandPdr( Abc_Frame_t * pAbc, int argc, char ** argv )
     return 0;
 
 usage:
-    Abc_Print( -2, "usage: pdr [-MFCDQTHGS <num>] [-LI <file>] [-axrmuyfqipdegjonctkvwzhbsl]\n" );
+    Abc_Print( -2, "usage: pdr [-MFCDQTHGSE <num>] [-LI <file>] [-axrmuyfqipdegjonctkvwzhbsl]\n" );
     Abc_Print( -2, "\t         model checking using property directed reachability (aka IC3)\n" );
     Abc_Print( -2, "\t         pioneered by Aaron R. Bradley (http://theory.stanford.edu/~arbrad/)\n" );
     Abc_Print( -2, "\t         with improvements by Niklas Een (http://een.se/niklas/)\n" );
@@ -32828,6 +32847,7 @@ usage:
     Abc_Print( -2, "\t-H num : runtime limit per output, in milliseconds (with \"-a\") [default = %d]\n",    pPars->nTimeOutOne );
     Abc_Print( -2, "\t-G num : runtime gap since the last CEX (0 = no limit) [default = %d]\n",              pPars->nTimeOutGap );
     Abc_Print( -2, "\t-S num : * value to seed the SAT solver with [default = %d]\n",                          pPars->nRandomSeed );
+    Abc_Print( -2, "\t-E num : always use fixed timeframe expansion min(num, current frame), >= 2 [default = dynamic]\n" );
     Abc_Print( -2, "\t-L file: the log file name [default = %s]\n",                                          pLogFileName ? pLogFileName : "no logging" );
     Abc_Print( -2, "\t-I file: the invariant file name [default = %s]\n",                                    pPars->pInvFileName ? pPars->pInvFileName : "default name" );
     Abc_Print( -2, "\t-a     : toggle solving all outputs even if one of them is SAT [default = %s]\n",      pPars->fSolveAll? "yes": "no" );

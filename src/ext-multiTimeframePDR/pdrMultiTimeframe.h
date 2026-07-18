@@ -10,6 +10,11 @@ extern "C" {
 // Global flag to enable/disable multi-timeframe PDR (pdr -s; default off)
 extern int use_multi_timeframe;
 
+// Fixed timeframe expansion (-E): every first-level query uses
+// expansion = min(current kMax, this value), unconditionally
+// (no time-triggered restarts); -1 = dynamic (default)
+extern int mtf_fixed_timeframe_expansion;
+
 // Per-run reset: restart controller state and unrolled AIG/CNF/solver caches
 // (must be called at the start of every PDR run when mt is enabled)
 void PdrMultiTimeframe_OnRunStart(void);

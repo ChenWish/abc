@@ -42,6 +42,11 @@ extern "C" int * Pdr_ManSortByPriority( Pdr_Man_t * p, Pdr_Set_t * pCube );
 // Global flag to enable/disable multi-timeframe PDR (pdr -s)
 int use_multi_timeframe = 0;
 
+// Fixed timeframe expansion (-E): every first-level query uses
+// expansion = min(current kMax, this value), unconditionally from the start
+// of every ManBlockCube call (no time-triggered restarts); -1 = dynamic (default)
+int mtf_fixed_timeframe_expansion = -1;
+
 //////////////////////////////////////////////////////////////////////////
 // Multi-timeframe parameters
 //
@@ -280,6 +285,11 @@ struct MultiTimeframeManager {
     // the deepened expansion is always >= 2 — for every config.
     bool is_time_to_restart(const abctime& time, int& timeframe_expansion) {
         if (!use_multi_timeframe) {
+            return false;
+        }
+        // Fixed expansion mode (-E): the expansion is applied unconditionally
+        // at ManBlockCube entry; time-triggered restarts are disabled.
+        if (mtf_fixed_timeframe_expansion > 0) {
             return false;
         }
         const MtParams& mt = mt_params();
@@ -1196,6 +1206,9 @@ static int PdrMultiTimeframe_ManBlockCube_for_first_level(Pdr_Man_t *p, Pdr_Obl_
 // Main multi-timeframe block cube function
 //////////////////////////////////////////////////////////////////////////
 
+// last effective fixed expansion announced in the log (fixed mode only)
+static int mtf_fixed_last_printed_expansion = -1;
+
 extern "C" int PdrMultiTimeframe_ManBlockCube(Pdr_Man_t *p, Pdr_Set_t *pCube) {
     Pdr_Obl_t *pThis;
     Pdr_Set_t *pPred, *pCubeMin;
@@ -1206,9 +1219,25 @@ extern "C" int PdrMultiTimeframe_ManBlockCube(Pdr_Man_t *p, Pdr_Set_t *pCube) {
     
     multi_timeframe_manager.init(block_cube_start_clk, pCube, kMax);
     // Alg. 3's l for this episode: 1 = standard PDR, > 1 = every top-level
-    // pop blocks multi-frame at this depth. Only is_time_to_restart ever
-    // raises it; nothing resets it to 1 within the episode.
+    // pop blocks multi-frame at this depth. Only is_time_to_restart (dynamic
+    // mode) or the -E block below ever raises it; nothing resets it to 1
+    // within the episode.
     int timeframe_expansion_for_first_level = 1;
+
+    // Fixed expansion mode (-E): every first-level query uses a
+    // min(kMax, fixed) unrolling from the start; no trigger conditions.
+    // kMax <= 1 falls back to the plain 1-frame query (expansion 1 is
+    // identical to it, and downstream asserts expansion > 1)
+    if (mtf_fixed_timeframe_expansion > 0) {
+        int fixed_exp = min(kMax, min(mtf_fixed_timeframe_expansion, multiTimeframe::L));
+        if (fixed_exp > 1) {
+            timeframe_expansion_for_first_level = fixed_exp;
+            if (fixed_exp != mtf_fixed_last_printed_expansion) {
+                Abc_Print(1, "\nfixed timeframe_expansion: %d\n", fixed_exp);
+                mtf_fixed_last_printed_expansion = fixed_exp;
+            }
+        }
+    }
 
     p->nBlocks++;
     pThis = Pdr_OblStart(kMax, Prio--, pCube, NULL);
