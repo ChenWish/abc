@@ -32566,13 +32566,15 @@ usage:
 int Abc_CommandPdr( Abc_Frame_t * pAbc, int argc, char ** argv )
 {
     extern int Abc_NtkDarPdr( Abc_Ntk_t * pNtk, Pdr_Par_t * pPars );
+    extern int use_proof_obligation_tree_logging;
     Pdr_Par_t Pars, * pPars = &Pars;
     Abc_Ntk_t * pNtk = Abc_FrameReadNtk(pAbc), * pNtkUsed, * pNtkFlop = NULL;
     char * pLogFileName = NULL;
     int c;
+    int fPotLogging = 0;
     Pdr_ManSetDefaultParams( pPars );
     Extra_UtilGetoptReset();
-    while ( ( c = Extra_UtilGetopt( argc, argv, "MFCDQTHGSLIaxrmuyfqipdegjonctkvwzhb" ) ) != EOF )
+    while ( ( c = Extra_UtilGetopt( argc, argv, "MFCDQTHGSLIaxrmuyfqipdegjonctkvwzhbl" ) ) != EOF )
     {
         switch ( c )
         {
@@ -32762,6 +32764,9 @@ int Abc_CommandPdr( Abc_Frame_t * pAbc, int argc, char ** argv )
         case 'b':
             pPars->fBlocking ^= 1;
             break;
+        case 'l':
+            fPotLogging ^= 1;
+            break;
         case 'h':
         default:
             goto usage;
@@ -32790,6 +32795,7 @@ int Abc_CommandPdr( Abc_Frame_t * pAbc, int argc, char ** argv )
     // run the procedure
     pPars->fUseBridge = pAbc->fBridgeMode;
     pNtkUsed = pNtkFlop ? pNtkFlop : pNtk;
+    use_proof_obligation_tree_logging = fPotLogging;
     pAbc->Status  = Abc_NtkDarPdr( pNtkUsed, pPars );
     pAbc->nFrames = pNtkUsed->vSeqModelVec ? -1 : pPars->iFrame;
     Abc_FrameReplacePoStatuses( pAbc, &pPars->vOutMap );
@@ -32803,7 +32809,7 @@ int Abc_CommandPdr( Abc_Frame_t * pAbc, int argc, char ** argv )
     return 0;
 
 usage:
-    Abc_Print( -2, "usage: pdr [-MFCDQTHGS <num>] [-LI <file>] [-axrmuyfqipdegjonctkvwzh]\n" );
+    Abc_Print( -2, "usage: pdr [-MFCDQTHGS <num>] [-LI <file>] [-axrmuyfqipdegjonctkvwzhbl]\n" );
     Abc_Print( -2, "\t         model checking using property directed reachability (aka IC3)\n" );
     Abc_Print( -2, "\t         pioneered by Aaron R. Bradley (http://theory.stanford.edu/~arbrad/)\n" );
     Abc_Print( -2, "\t         with improvements by Niklas Een (http://een.se/niklas/)\n" );
@@ -32841,6 +32847,7 @@ usage:
     Abc_Print( -2, "\t-w     : toggle printing detailed stats default = %s]\n",                              pPars->fVeryVerbose? "yes": "no" );
     Abc_Print( -2, "\t-z     : toggle suppressing report about solved outputs [default = %s]\n",             pPars->fNotVerbose? "yes": "no" );
     Abc_Print( -2, "\t-b     : toggle clause pushing with blocking [default = %s]\n",                        pPars->fBlocking? "yes": "no" );
+    Abc_Print( -2, "\t-l     : toggle proof-obligation tree logging [default = %s]\n",                       fPotLogging? "yes": "no" );
     Abc_Print( -2, "\t-h     : print the command usage\n\n");
     Abc_Print( -2, "\t* Implementation of switches -S, -n, and -c is contributed by Zyad Hassan.\n");
     Abc_Print( -2, "\t  The theory and experiments supporting this work can be found in the following paper:\n");

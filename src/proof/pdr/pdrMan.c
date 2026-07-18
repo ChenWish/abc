@@ -20,6 +20,7 @@
 
 #include "pdrInt.h"
 #include "sat/bmc/bmc.h"
+#include "ext-multiTimeframePDR/pdrProofObligationTreeLogger.h"
 
 ABC_NAMESPACE_IMPL_START
 
@@ -345,6 +346,9 @@ void Pdr_ManStop( Pdr_Man_t * p )
     Vec_VecForEachEntry( Pdr_Set_t *, p->vClauses, pCla, i, k )
         Pdr_SetDeref( pCla );
     Vec_VecFree( p->vClauses );
+    // end of run: obligations left in the queue were not restarted away, so drop the
+    // logger tree silently instead of letting Pdr_QueueStop print is_restart records
+    Pdr_ProofObligationTree_Clear();
     Pdr_QueueStop( p );
     ABC_FREE( p->pOrder );
     Vec_IntFree( p->vActVars );

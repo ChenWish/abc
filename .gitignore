@@ -14,7 +14,7 @@ lib/bip*
 docs/
 .cache/
 
-src/ext*
+# src/ext*
 src/xxx/
 src/aig/au/
 src/aig/ssm/

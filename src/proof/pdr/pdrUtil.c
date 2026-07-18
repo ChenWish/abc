@@ -19,6 +19,7 @@
 ***********************************************************************/
 
 #include "pdrInt.h"
+#include "ext-multiTimeframePDR/pdrProofObligationTreeLogger.h"
 
 ABC_NAMESPACE_IMPL_START
 
@@ -632,6 +633,8 @@ Pdr_Obl_t * Pdr_QueuePop( Pdr_Man_t * p )
 void Pdr_QueueClean( Pdr_Man_t * p )
 {
     Pdr_Obl_t * pThis;
+    // discarding the queue abandons every pending obligation: close out the logger tree first
+    Pdr_ProofObligationTree_FlushAllRoots();
     while ( (pThis = Pdr_QueuePop(p)) )
         Pdr_OblDeref( pThis );
     pThis = NULL;
@@ -699,6 +702,8 @@ void Pdr_QueuePrint( Pdr_Man_t * p )
 void Pdr_QueueStop( Pdr_Man_t * p )
 {
     Pdr_Obl_t * pObl;
+    // discarding the queue abandons every pending obligation: close out the logger tree first
+    Pdr_ProofObligationTree_FlushAllRoots();
     while ( !Pdr_QueueIsEmpty(p) )
     {
         pObl = Pdr_QueuePop(p);
