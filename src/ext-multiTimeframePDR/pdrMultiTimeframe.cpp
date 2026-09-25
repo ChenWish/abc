@@ -91,6 +91,14 @@ struct MtParams {
     // ABC_MT_EXP_CAP (default off = -1): absolute expansion bound below the
     // structural cap; memory insurance
     int exp_cap;
+    // ABC_MT_NEG_C_MID (default off, enable with any nonzero integer): also
+    // place the anchored ~c on the intermediate unroll copies X(1)..X(l-1),
+    // not only on X(0). Sound (an intermediate state in c would itself be a
+    // shallower violation) and strictly stronger: more constraints make the
+    // query UNSAT more often, so more literal drops are accepted, and the
+    // solver prunes paths through c earlier. Never placed on X(l) - the
+    // target must stay the full candidate d
+    bool neg_c_mid;
     // ABC_MT_LOG (default off, enable with any nonzero integer): print one
     // line per SelectDepth event (breakthrough, restart) in the format
     // "TimeStamp = <seconds since run start, 2 decimals> : <event>"
@@ -144,6 +152,7 @@ static const MtParams& mt_params() {
         p.ratio_ramp_sec = (mt_env_double("ABC_MT_RATIO_RAMP_SEC", &d) && d > 0.0) ? d : 2400.0;
         p.overshoot_max = (mt_env_int("ABC_MT_EXP_OVERSHOOT", &i) && i >= 0) ? i : 2;
         p.exp_cap = (mt_env_int("ABC_MT_EXP_CAP", &i) && i >= 1) ? i : -1;
+        p.neg_c_mid = mt_env_int("ABC_MT_NEG_C_MID", &i) && i != 0;
         p.log = mt_env_int("ABC_MT_LOG", &i) && i != 0;
         // Print the resolved parameters once, in the shared cross-tool
         // format (env names without the tool prefix).
@@ -157,7 +166,8 @@ static const MtParams& mt_params() {
             Abc_Print(1, "%d", p.exp_cap);
         else
             Abc_Print(1, "off");
-        Abc_Print(1, " MT_LOG=%s\n", p.log ? "on" : "off");
+        Abc_Print(1, " MT_NEG_C_MID=%s MT_LOG=%s\n", p.neg_c_mid ? "on" : "off",
+                  p.log ? "on" : "off");
         return p;
     }();
     return params;
@@ -357,14 +367,13 @@ struct SolvingData {
     vector<int> Var2Ids;
     int k;
     int timeframe_expansion;
-    int solver_activation_var_num;
 
     SolvingData() : pSat(NULL), pAig(NULL), pCnf(NULL), k(-1), 
-                    timeframe_expansion(-1), solver_activation_var_num(0) {}
+                    timeframe_expansion(-1) {}
     
     SolvingData(sat_solver* sat, Aig_Man_t* aig, Cnf_Dat_t* cnf, int frame, int tf_exp) 
         : pSat(sat), pAig(aig), pCnf(cnf), k(frame), 
-          timeframe_expansion(tf_exp), solver_activation_var_num(0) {
+          timeframe_expansion(tf_exp) {
         Id2Vars.resize(Aig_ManObjNumMax(aig), -1);
         Var2Ids.reserve(500);
         Var2Ids.push_back(-1);
@@ -576,12 +585,6 @@ static int PdrMultiTimeframe_ObjSatVar(Pdr_Man_t *p, SolvingData& solving_data, 
     return iVarThis;
 }
 
-static int PdrMultiTimeframe_ManFreeVar(Pdr_Man_t *p, SolvingData& solving_data) {
-    solving_data.solver_activation_var_num++;
-    solving_data.Var2Ids.push_back(-1);
-    return solving_data.Var2Ids.size() - 1;
-}
-
 //////////////////////////////////////////////////////////////////////////
 // Cube to literals conversion
 //////////////////////////////////////////////////////////////////////////
@@ -622,6 +625,52 @@ static Vec_Int_t* PdrMultiTimeframe_ManCubeToLits(Pdr_Man_t *p, Pdr_Set_t *pCube
     else
         return PdrMultiTimeframe_ManCubeToLits_at_frame(p, solving_data, pCube, fCompl, 
                                                         solving_data.k - solving_data.timeframe_expansion);
+}
+
+//////////////////////////////////////////////////////////////////////////
+// Anchored negated side of the multi-timeframe query
+//////////////////////////////////////////////////////////////////////////
+
+// Every query in the l-step generalization is
+//     SAT? [ ~c(X(0)) & Unroll(f,l) & d(X(l)) ]
+// where c is the obligation cube this call started from and d is the current
+// candidate. Only the target side follows d; the negated side is pinned to c
+// for the whole call, so it is added here once, before any literal is dropped.
+//
+// Letting the negated side track d (~d, as standard PDR does at l == 1) is
+// wrong for l >= 2: dropping literals makes d weaker as a cube but larger as
+// a state set, so ~d is a *stronger* constraint than ~c, and the l-step query
+// only samples the state every l steps. A path whose first entry into d
+// happens inside the window has its only witness starting inside d, where
+// ~d(X(0)) rules it out - so UNSAT can coexist with a reachable state in d
+// and the learned clause then excludes a reachable state from the frames.
+// Anchoring on c closes that: such an escaping state either lies in c (then it
+// is itself a shallower violation, killed by minimality of the violation
+// depth) or it satisfies ~c(X(0)) and is a legal witness, contradicting UNSAT.
+//
+// With ABC_MT_NEG_C_MID the same ~c also goes on the intermediate copies
+// X(1)..X(l-1): sound by the same minimality argument and strictly stronger.
+// Never on X(l) - the target must stay the full d.
+//
+// The clauses are added unconditionally (no activation literal): the solver is
+// rebuilt per obligation in PdrMultiTimeframe_ManGetSolvingData, so they
+// cannot leak into another obligation's queries.
+static void PdrMultiTimeframe_ManAddAnchoredNegC(Pdr_Man_t *p, SolvingData& solving_data,
+                                                 Pdr_Set_t *pCube) {
+    const int start_frame = solving_data.k - solving_data.timeframe_expansion;
+    const int last_frame = mt_params().neg_c_mid ? solving_data.k - 1 : start_frame;
+    assert(start_frame <= last_frame && last_frame < solving_data.k);
+
+    for (int f = start_frame; f <= last_frame; ++f) {
+        Vec_Int_t *vLits = PdrMultiTimeframe_ManCubeToLits_at_frame(p, solving_data, pCube, 1, f);
+        const int RetValue = sat_solver_addclause(solving_data.pSat, Vec_IntArray(vLits),
+                                                  Vec_IntArray(vLits) + Vec_IntSize(vLits));
+        // ~c can only be refuted at decision level 0 if the initial state
+        // satisfies c, and an init-intersecting obligation never reaches here
+        assert(RetValue == 1);
+        (void)RetValue;
+    }
+    sat_solver_compress(solving_data.pSat);
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -850,25 +899,18 @@ static Pdr_Set_t* PdrMultiTimeframe_ManTernarySim(Pdr_Man_t *p, SolvingData& sol
 // Multi-timeframe check cube
 //////////////////////////////////////////////////////////////////////////
 
-static int PdrMultiTimeframe_ManCheckCube(Pdr_Man_t *p, Pdr_Set_t *pCube, SolvingData& solving_data, 
-                                           Pdr_Set_t **ppPred, int nConfLimit, int fTryConf, int fUseLit) {
+// Assumptions are the target side only: d(X(l)). The negated side ~c is a
+// permanent clause of this obligation's solver, installed once by
+// PdrMultiTimeframe_ManAddAnchoredNegC, so it does NOT follow the shrinking
+// candidate d.
+static int PdrMultiTimeframe_ManCheckCube(Pdr_Man_t *p, Pdr_Set_t *pCube, SolvingData& solving_data,
+                                           Pdr_Set_t **ppPred, int nConfLimit, int fTryConf) {
     Vec_Int_t *vLits;
-    int Lit, RetValue;
+    int RetValue;
     abctime clk, Limit;
     p->nCalls++;
 
-    if (fUseLit) {
-        vLits = PdrMultiTimeframe_ManCubeToLits(p, pCube, solving_data, 1, 0);
-        Lit = Abc_Var2Lit(PdrMultiTimeframe_ManFreeVar(p, solving_data), 0);
-        Vec_IntPush(vLits, Lit);
-        RetValue = sat_solver_addclause(solving_data.pSat, Vec_IntArray(vLits), Vec_IntArray(vLits) + Vec_IntSize(vLits));
-        assert(RetValue == 1);
-        sat_solver_compress(solving_data.pSat);
-        vLits = PdrMultiTimeframe_ManCubeToLits(p, pCube, solving_data, 0, 1);
-        Vec_IntPush(vLits, Abc_LitNot(Lit));
-    } else {
-        vLits = PdrMultiTimeframe_ManCubeToLits(p, pCube, solving_data, 0, 1);
-    }
+    vLits = PdrMultiTimeframe_ManCubeToLits(p, pCube, solving_data, 0, 1);
 
     clk = Abc_Clock();
     Limit = sat_solver_set_runtime_limit(solving_data.pSat, Pdr_ManTimeLimit(p));
@@ -920,7 +962,10 @@ static int PdrMultiTimeframe_ManGeneralize(Pdr_Man_t *p, Pdr_Set_t *pCube, Solvi
     int *pOrder;
     
     *ppCubeMin = NULL;
-    RetValue = PdrMultiTimeframe_ManCheckCube(p, pCube, solving_data, ppPred, p->pPars->nConfLimit, 0, 1);
+    // Pin the negated side to the obligation cube before anything is dropped:
+    // every query below is  ~c(X(0)) & Unroll & d(X(l)),  with only d moving.
+    PdrMultiTimeframe_ManAddAnchoredNegC(p, solving_data, pCube);
+    RetValue = PdrMultiTimeframe_ManCheckCube(p, pCube, solving_data, ppPred, p->pPars->nConfLimit, 0);
 
     if (RetValue == -1)
         return -1;
@@ -944,7 +989,7 @@ static int PdrMultiTimeframe_ManGeneralize(Pdr_Man_t *p, Pdr_Set_t *pCube, Solvi
 
             Lit = pCubeMin->Lits[i]; 
             pCubeMin->Lits[i] = -1;
-            RetValue = PdrMultiTimeframe_ManCheckCube(p, pCubeMin, solving_data, NULL, p->pPars->nConfLimit, 1, 0);
+            RetValue = PdrMultiTimeframe_ManCheckCube(p, pCubeMin, solving_data, NULL, p->pPars->nConfLimit, 1);
 
             if (RetValue == -1) {
                 Pdr_SetDeref(pCubeMin);
