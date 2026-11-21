@@ -212,6 +212,10 @@ void Gip_SolverCleanTemporary( Gip_Solver_t * p )
     }
     while ( Vec_IntSize(p->Cdb.vTemp) > 0 )
         Gip_SolverDetachClause( p, Vec_IntPop(p->Cdb.vTemp) );
+    // the jftr mode's list of the round's constraint clauses refers to clauses that were just detached: it is emptied here, by the
+    // operation that removes them, so that no later garbage collection relocates a detached clause
+    Vec_IntClear( p->Jftr.vCst );
+    Vec_IntClear( p->Jftr.vCstWit );
     if ( p->pValue[p->constrainAct] != GIP_NONE )
     {
         int i, Lit, k = 0;
@@ -219,8 +223,15 @@ void Gip_SolverCleanTemporary( Gip_Solver_t * p )
         {
             if ( Gip_LitVar(Lit) != p->constrainAct )
                 Vec_IntWriteEntry( p->vTrail, k++, Lit );
-            else if ( i < p->nPropagated )
-                p->nPropagated--;
+            else
+            {
+                if ( i < p->nPropagated )
+                    p->nPropagated--;
+                if ( i < p->Jftr.nRootSeen )
+                    p->Jftr.nRootSeen--;   // jftr mode: the classified prefix of the root trail shifts with the removed entry
+                if ( i < p->Jftr.nIncSeen )
+                    p->Jftr.nIncSeen--;        // likewise the prefix the incremental cover examined
+            }
         }
         Vec_IntShrink( p->vTrail, k );
         Gip_SolverSetNone( p, p->constrainAct );
@@ -368,6 +379,7 @@ void Gip_SolverStrengthenClause( Gip_Solver_t * p, int Cref, int Lit )
     for ( pos = 0; pos < fLearnt + 1; pos++ )
         pA->pData[Cref + nLits + pos] = pA->pData[Cref + nLits + 1 + pos];
     Gip_ClaSetLen( pA, Cref, nLits - 1 );
+    Gip_ClaLostLit( pA, Cref );
     Gip_WatchersAttach( p, Cref );
 }
 
@@ -407,6 +419,9 @@ void Gip_SolverGarbageCollect( Gip_Solver_t * p )
         Vec_IntWriteEntry( p->Cdb.vLearnt, i, Gip_AllocReloc(pOld, Cref, &New) );
     Vec_IntForEachEntry( p->Cdb.vTemp, Cref, i )
         Vec_IntWriteEntry( p->Cdb.vTemp, i, Gip_AllocReloc(pOld, Cref, &New) );
+    // the jftr mode's list of the round's constraint clauses (all of them live temporaries)
+    Vec_IntForEachEntry( p->Jftr.vCst, Cref, i )
+        Vec_IntWriteEntry( p->Jftr.vCst, i, Gip_AllocReloc(pOld, Cref, &New) );
     // reasons of trail literals
     Vec_IntForEachEntry( p->vTrail, Lit, i )
         if ( p->pReason[Gip_LitVar(Lit)] != GIP_CREF_NONE )

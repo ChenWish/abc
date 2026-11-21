@@ -111,7 +111,7 @@ typedef struct Gip_Domain_t_
 // (frame << 1) for a frame value, or (lemma id << 1 | 1) for a lemma clause whose current
 // frame is read from the table set by Gip_SolverSetLemFrames; GIP_FRAME_INF = no dependency
 #define GIP_FRAME_INF  0x3fffffff
-// header bits: 0 trans, 1 learnt, 2 reloced, 3 marked, 4 removed, 5..31 len
+// header bits: 0 trans, 1 learnt, 2 reloced, 3 whole (see GIP_CLA_WHOLE), 4 removed, 5..31 len
 typedef struct Gip_Alloc_t_
 {
     unsigned *   pData;
@@ -190,7 +190,22 @@ typedef struct Gip_Ctx_t_
     int *        pDepData;
     int          nDepData;
     int          iUnusedPiVar; // -1, or an unconstrained alias used only for unreferenced PIs
+    int          fJftrCnf;    // the CNF is Cnf_DeriveOther's as derived (no structural encoding, no variable elimination): the jftr mode is
+                              // defined only for such a CNF (with var == object id, see the JFTR MODE comment in gipSearch.c)
+    // jftr mode (built on first use by Gip_CtxPrepareJftr)
+    char *       pKind;       // per var: GIP_KIND_*
+    int *        pCc;         // per var, 4 ints: cost of justifying value 0 / 1 in registers, and in gates (SCOAP-like)
+    int *        pLoIdx;      // per var: index among the register-output vars (-1 = not one)
+    int *        pClsSplit;   // per var with defining clauses: the first clause of the second polarity group, when the clauses with one literal of the var
+                              // all come before the clauses with the other (-1 otherwise): a node with a value needs only the group of its false literal
+    char *       pClsPol0;    // per var: the sign (1 = negative) of the var's literal in the clauses of the first group
+    int          nLo;
 } Gip_Ctx_t;
+#define GIP_KIND_OTHER  0   // constant, or an AIG node without defining clauses (inside a cut)
+#define GIP_KIND_NODE   1   // mapped node: a cut function defined by clauses over its leaves
+#define GIP_KIND_PI     2
+#define GIP_KIND_LO     3   // register output (current state)
+#define GIP_KIND_CO     4   // register input or property output (defined by two clauses)
 
 static inline int Gip_CtxObjVar( Gip_Ctx_t * p, Aig_Obj_t * pObj )
 {
@@ -227,6 +242,82 @@ typedef struct Gip_Batch_t_
     Vec_Int_t * vPrevious;        // assumptions actually submitted to search
     int nResumed;
 } Gip_Batch_t;
+// the debug checks of the jftr mode (PDR2_JFTR_CHECK, see gipSearch.c): the items checked; a failed check stops the run
+typedef struct Gip_JftrVer_t_
+{
+    ABC_INT64_T  nEarly;          // early answers checked: every assigned node of the domain is closed (level 1)
+    ABC_INT64_T  nEarlyOut;       // ... assigned nodes open only in clauses with an unassigned literal outside the domain (allowed)
+    ABC_INT64_T  nModel;          // completions of early answers checked against every clause (level 2, three per answer)
+    ABC_INT64_T  nModelOut;       // ... nodes not evaluated because a fanin outside the domain has no value (inconclusive)
+    ABC_INT64_T  nFlip;           // states after flip-to-none checked against every clause (level 2)
+    ABC_INT64_T  nCover;          // lemma clauses checked where the lemma cover was declared complete (level 2)
+} Gip_JftrVer_t;
+
+// state of the jftr mode of one solver (see JFTR MODE in gipSearch.c)
+typedef struct Gip_Jftr_t_
+{
+    int          fVerify;         // level of the debug checks (PDR2_JFTR_CHECK), set by the caller after the solver is created; kept by a copy
+    int          fCopied;         // the solver holds state imported from another solver (Gip_SolverCloneRoot, Gip_SolverWarmStartMode):
+                                  // the mode is not defined for it, its callers use the ordinary search
+    Gip_JftrVer_t Ver;            // the counts of the debug checks
+    // the request for the next solve (Gip_SolverSetJftr); every Gip_SolverSolve consumes it
+    int          nReqConf;
+    int          fReqWalk;
+    int          fReqShrink;
+    // the current solve
+    int          nConf;           // conflict budget of the mode (0 = ordinary search)
+    int          fActive;         // the solve is (still) in the mode
+    int          fLeaves;         // the answer may become a predecessor cube: the justification walk runs
+    int          fShrink;         // ... and only the leaves of the walk stay assigned
+    int          fEarly;          // the answer: SAT found by the early stop
+    int          fWalkClosed;     // the answer: its justification walk closed (the transition-only certificate exists)
+    int *        pAssump;         // the assumptions (the targets of the justification walk); points into vAssumpOwn
+    Vec_Int_t *  vAssumpOwn;
+    int          nAssump;
+    int          nAssumpCur;      // the decision levels 1..nAssumpCur hold the assumptions
+    // the register completion: an early answer stands for "the assignment, else pM"
+    char *       pM;              // per register (pCtx->pLoIdx): GIP_TRUE / GIP_FALSE; the registers assigned by an early answer take its values
+    // the frontier of nodes to justify
+    Vec_Int_t *  vFront;          // assigned vars that may have an open defining clause (verified when popped)
+    int *        pCur;            // per var: the defining clauses before this index were found satisfied since the var was last queued
+    int          iScan;           // trail position up to which the register literals were counted
+    int          iCheck;          // trail position up to which the nodes were checked for open clauses (reset by backtracks)
+    int          iTrueLit;        // the true literal the clause picker stopped at
+    Vec_Int_t *  vMarked;         // vars marked by the justification walk (pMark is reused; cleared after the walk)
+    // nodes assigned at level 0 that have a defining clause without a level-0 true literal (root facts such as the asserted
+    // property and what it implies at level 0)
+    Vec_Int_t *  vRootOpen;       // all of them, kept across solves
+    Vec_Int_t *  vRootFront;      // those of the current domain: closed like the nodes assigned above level 0
+    int          nRootSeen;       // root trail entries already classified
+    int          fRootNewSolve;   // the root nodes of the domain are collected again at the first scan of the solve
+    int          fRootRecheck;    // the root nodes go back to the frontier at the next scan (start of the solve, after every backtrack)
+    // the constraint clauses of the round
+    Vec_Int_t *  vCst;            // their clause references
+    Vec_Int_t *  vCstWit;         // per constraint clause: the literal found true last (checked first), or -1
+    Vec_Int_t *  vCstFree;        // per clause that is left to a free register outside the domain: the literal that satisfies it
+    // the lemma cover: a lemma clause (over register literals) is covered by a register literal that is true, or unassigned and
+    // true in pM. One witness literal per lemma position; rebuilt when the lemma list was edited (simplification)
+    int          fBuilt;          // the tables below exist
+    int          fOccDirty;       // the lemma list was edited: rebuild before the next solve in the mode
+    int *        pWit;            // per lemma position: the witness literal or -1
+    char *       pSat0;           // per lemma position: satisfied for good by a literal true at level 0
+    int          nCntAlloc;       // lemma positions allocated in pWit / pSat0
+    int          iLo;             // cursor into the lemma list: the position after the last clause a decision was made for (the cyclic
+                                  // scan for an uncovered clause goes on from there)
+    int          nVerified;       // lemma positions verified covered in a row, cyclically from iVerStart, since the last
+                                  // unassignment; all are covered at Vec_IntSize(vLemmas)
+    int          iVerStart;       // where that run starts (iLo at the last unassignment)
+    // the incremental lemma cover: a position is clean when pSat0 holds or its witness covers it; every event that can end that
+    // makes it dirty, and the cover step examines only the dirty positions, in the cyclic order of a full scan
+    word *       pIncDirty;       // per lemma position, one bit: dirty
+    word *       pIncSum;         // per word of pIncDirty, one bit: the word is not zero
+    int          nIncWords;       // words allocated in pIncDirty
+    int *        pIncListed;      // per lemma position: the witness literal whose list (pIncOcc) holds it, or -1
+    Vec_Int_t ** pIncOcc;         // per register literal (2 * pLoIdx + compl): the clean positions whose witness it is (an entry whose
+                                  // pIncListed differs is stale)
+    Vec_Int_t *  vIncVol;         // clean positions whose witness is true on the trail only, not in pM: dirty again at the next backtrack
+    int          nIncSeen;        // the root trail before this index was examined for registers assigned against pM
+} Gip_Jftr_t;
 
 typedef struct Gip_Solver_t_
 {
@@ -312,6 +403,7 @@ typedef struct Gip_Solver_t_
     ABC_INT64_T  nTimeCheck;      // propagation count at which the deadline is checked next
     ABC_INT64_T  nPropLimit;      // 0 = none; absolute propagation count at which the solve is canceled
     int          fCanceled;       // set when limit hit
+    Gip_Jftr_t   Jftr;            // state of the jftr mode
     // scratch
     Vec_Int_t *  vSimpCls;        // simplify_clause output
     Vec_Int_t *  vSeeds;          // domain seeds scratch
@@ -402,6 +494,14 @@ extern void           Gip_CdbFree( Gip_Cdb_t * p );
 extern int            Gip_SolverAttachClause( Gip_Solver_t * p, int * pLits, int nLits, int Kind );
 extern void           Gip_SolverDetachClause( Gip_Solver_t * p, int Cref );
 extern void           Gip_SolverCleanTemporary( Gip_Solver_t * p );
+// the value of a register that an early answer left unassigned: its value in the register completion (pM)
+static inline int     Gip_SolverCoverValue( Gip_Solver_t * p, int Var )        { return p->Jftr.pM[p->pCtx->pLoIdx[Var]];      }
+// Requests the jftr mode for the NEXT solve of the solver (see JFTR MODE in gipSearch.c). nBudget = conflicts after which the solve
+// goes on as the ordinary search (0 = the ordinary search from the start); fWalk = the answer may become a predecessor, so an early
+// answer gets its justification walk; fShrink = and only the leaves of that walk stay assigned. Every solve consumes the request, so
+// the solve after it is ordinary unless the mode is requested again. A request made while a batch exists (Gip_SolverStartBatch) is
+// consumed and ignored. Which solvers and queries the mode is defined for is the caller's side of the contract, stated with the mode.
+static inline void    Gip_SolverSetJftr( Gip_Solver_t * p, int nBudget, int fWalk, int fShrink ) { p->Jftr.nReqConf = nBudget; p->Jftr.fReqWalk = fWalk; p->Jftr.fReqShrink = fShrink; }
 extern void           Gip_SolverCleanLearnt( Gip_Solver_t * p, int fFull );
 extern void           Gip_SolverStrengthenClause( Gip_Solver_t * p, int Cref, int Lit );
 extern void           Gip_SolverGarbageCollect( Gip_Solver_t * p );
@@ -415,6 +515,11 @@ static inline int        Gip_ClaIsRemoved( Gip_Alloc_t * p, int Cref )    { retu
 static inline void       Gip_ClaSetRemoved( Gip_Alloc_t * p, int Cref )   { p->pData[Cref] |= (1u << 4);                  }
 static inline void       Gip_ClaSetReloced( Gip_Alloc_t * p, int Cref )   { p->pData[Cref] |= (1u << 2);                  }
 static inline void       Gip_ClaSetLen( Gip_Alloc_t * p, int Cref, int n ){ p->pData[Cref] = (p->pData[Cref] & 31u) | (((unsigned)n) << 5); }
+// bit 3 of a transition clause (jftr mode): the stored clause still has every literal of its static clause; set when the clause
+// is added unstripped, cleared when a literal is removed, kept by Gip_ClaSetLen (low five bits) and copied by the garbage collection
+#define GIP_CLA_WHOLE (1u << 3)
+static inline int        Gip_ClaIsWholeTrans( Gip_Alloc_t * p, int Cref ) { return (p->pData[Cref] & (1u | GIP_CLA_WHOLE)) == (1u | GIP_CLA_WHOLE); }
+static inline void       Gip_ClaLostLit( Gip_Alloc_t * p, int Cref )      { if ( p->pData[Cref] & 1u ) p->pData[Cref] &= ~GIP_CLA_WHOLE; }   // a transition clause that lost a literal is not whole
 static inline int *      Gip_ClaLits( Gip_Alloc_t * p, int Cref )         { return (int *)(p->pData + Cref + 1);          }
 static inline float      Gip_ClaAct( Gip_Alloc_t * p, int Cref )          { float f; memcpy( &f, p->pData + Cref + 1 + Gip_ClaLen(p, Cref), 4 ); return f; }
 static inline unsigned   Gip_ClaTagWord( Gip_Alloc_t * p, int Cref )      { return p->pData[Cref + 1 + Gip_ClaLen(p, Cref) + Gip_ClaIsLearnt(p, Cref)]; }
@@ -435,11 +540,20 @@ extern void           Gip_SolverAnalyzeUnsatCore( Gip_Solver_t * p, int Lit );
 
 // gipSearch.c
 extern void           Gip_SolverNewLevel( Gip_Solver_t * p );
+extern void           Gip_JftrVerifyFlipped( Gip_Solver_t * p );   // debug (PDR2_JFTR_CHECK >= 2): the state after flip-to-none against every clause
 extern void           Gip_SolverBacktrack( Gip_Solver_t * p, int Level, int fVsids );
 extern int            Gip_SolverCanSkipDecision( Gip_Solver_t * p, int Var );
 extern void           Gip_SolverWakeSkipped( Gip_Solver_t * p, int fVsids );
 extern void           Gip_SolverCheckPartialModel( Gip_Solver_t * p, int * pAssump, int nAssump );
 extern int            Gip_SolverSearchWithRestart( Gip_Solver_t * p, int * pAssump, int nAssump, int nRestartLimit );
+extern void           Gip_CtxPrepareJftr( Gip_Ctx_t * p );
+extern int            Gip_SolverDecideJftr( Gip_Solver_t * p );
+extern void           Gip_SolverJftrRebuild( Gip_Solver_t * p );
+extern void           Gip_SolverJftrLemmaAdded( Gip_Solver_t * p );
+extern void           Gip_SolverJftrInit( Gip_Solver_t * p );
+extern void           Gip_SolverJftrStart( Gip_Solver_t * p, int * pAssump, int nAssump );
+extern void           Gip_SolverJftrFree( Gip_Solver_t * p );
+extern void           Gip_SolverJftrIncRoot( Gip_Solver_t * p );
 
 // gipVsids.c
 extern void           Gip_HeapClear( Gip_Heap_t * p );

@@ -519,13 +519,19 @@ static Gip_Ctx_t * Gip_CtxCreateInt( Aig_Man_t * pAig, Cnf_Man_t * pCnfMan, int 
     if ( fPdr2 )
     {
         int Mode = Gip_OptionGet("PDR2_CNF") ? atoi(Gip_OptionGet("PDR2_CNF")) : 0;
+        Cnf_Dat_t * pCnfOther;
         p->pCnf = Mode == 1 || Mode == 2 ? Gip_CnfStructural(pAig, Mode) : Cnf_DeriveOtherWithMan(pCnfMan, pAig, 0);
+        pCnfOther = Mode == 1 || Mode == 2 ? NULL : p->pCnf;
         p->pCnf = Gip_CnfBve(pAig,p->pCnf);
+        p->fJftrCnf = p->pCnf == pCnfOther;   // Cnf_DeriveOther's CNF, not replaced by the variable elimination
         if ( Gip_OptionGet("PDR2_CNF_STATS") )
             Abc_Print( 1, "CNF encoding %d: %d clauses, %d literals.\n", Mode, p->pCnf->nClauses, p->pCnf->nLiterals );
     }
     else
+    {
         p->pCnf = Cnf_DeriveOtherWithMan( pCnfMan, pAig, 0 );
+        p->fJftrCnf = 1;
+    }
     p->nVars = p->pCnf->nVars;
     assert( p->nVars == Aig_ManObjNumMax(pAig) );
     nObjs = Aig_ManObjNumMax( pAig );
@@ -685,6 +691,11 @@ void Gip_CtxFree( Gip_Ctx_t * p )
     ABC_FREE( p->pDepData );
     ABC_FREE( p->pObj2Var );
     ABC_FREE( p->pVar2Obj );
+    ABC_FREE( p->pKind );
+    ABC_FREE( p->pCc );
+    ABC_FREE( p->pLoIdx );
+    ABC_FREE( p->pClsSplit );
+    ABC_FREE( p->pClsPol0 );
     ABC_FREE( p );
 }
 

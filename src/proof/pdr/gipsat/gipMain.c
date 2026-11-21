@@ -162,6 +162,7 @@ static Gip_Solver_t * Gip_SolverNewInt( Gip_Ctx_t * pCtx, int fLazy )
         p->pJustSkip = ABC_CALLOC( char, p->nVarsAlloc );
         p->vJustSkip = Vec_IntAlloc( 100 );
     }
+    Gip_SolverJftrInit( p );
     p->nLastNumLemma = 1000;
     p->nCleanIdle = -1;
     if ( fLazy )
@@ -311,6 +312,8 @@ Gip_Solver_t * Gip_SolverCloneRoot( Gip_Solver_t * pSrc )
     p->vRecycleQueue = pSrc->vRecycleQueue ? Vec_IntDup(pSrc->vRecycleQueue) : NULL;
     p->vRecycleTmp = pSrc->vRecycleTmp ? Vec_IntDup(pSrc->vRecycleTmp) : NULL;
     p->Stats.nRecycleTry = p->Stats.nRecycled = 0;
+    Gip_SolverJftrInit( p );   // its own state: the pointers copied above belong to the source
+    p->Jftr.fCopied = 1;
     return p;
 }
 
@@ -332,6 +335,8 @@ int Gip_SolverWarmStartMode( Gip_Solver_t * p, Gip_Solver_t * pSrc, int Mode )
     assert( Gip_SolverLevelOf(p) == 0 );
     if ( p->fTrivialUnsat || pSrc->fTrivialUnsat )
         return 0;
+    // nothing of the jftr state is copied or shared; the imported facts and heuristics are outside what the mode is defined for
+    p->Jftr.fCopied = 1;
     if ( Mode & 4 )
     {
     Vec_IntForEachEntry( pSrc->vTrail, Lit, i )
@@ -486,6 +491,7 @@ void Gip_SolverFree( Gip_Solver_t * p )
     Vec_IntFreeP( &p->vRecycleCond );
     Vec_IntFreeP( &p->vRecycleQueue );
     Vec_IntFreeP( &p->vRecycleTmp );
+    Gip_SolverJftrFree( p );
     ABC_FREE( p );
 }
 
@@ -675,7 +681,14 @@ int Gip_SolverAddClauseTag( Gip_Solver_t * p, int * pLits, int nLits, int Kind, 
         }
         return GIP_CREF_NONE;
     }
-    return Gip_SolverAttachClauseTag( p, Vec_IntArray(p->vSimpCls), Vec_IntSize(p->vSimpCls), Kind, TagWord );
+    {
+        int Cref = Gip_SolverAttachClauseTag( p, Vec_IntArray(p->vSimpCls), Vec_IntSize(p->vSimpCls), Kind, TagWord );
+        // a transition clause stored with all the literals of its static clause, see GIP_CLA_WHOLE. This relies on the kind TRANS being
+        // used only for the static defining clauses of the circuit, as it is: not for any other clause that the transition relation entails
+        if ( Cref != GIP_CREF_NONE && Kind == GIP_CLA_TRANS && !fStripped && Vec_IntSize(p->vSimpCls) == nLits )
+            p->Cdb.Alloc.pData[Cref] |= GIP_CLA_WHOLE;
+        return Cref;
+    }
 }
 int Gip_SolverAddClauseInner( Gip_Solver_t * p, int * pLits, int nLits, int Kind )
 {
@@ -696,6 +709,9 @@ int Gip_SolverAddClauseInner( Gip_Solver_t * p, int * pLits, int nLits, int Kind
 void Gip_SolverReset( Gip_Solver_t * p )
 {
     Gip_SolverBacktrack( p, 0, 0 );
+    // an answer of the jftr mode ends here with its assignment; the trail above was retired with the mode still marked active, as at
+    // the entry of a solve, so its literals were not saved as phases
+    p->Jftr.fEarly = p->Jftr.fWalkClosed = 0;
     Gip_SolverCleanTemporary( p );
     p->fPreparedVsids = 0;
     Gip_DomainReset( &p->Domain );
@@ -742,7 +758,8 @@ void Gip_SolverAddLemmaId( Gip_Solver_t * p, int * pLits, int nLits, int Id )
             Gip_SolverLoadVar( p, Gip_LitVar(pLits[i]) );
     for ( i = 0; i < nLits; i++ )
         Gip_SolverAddDomain( p, Gip_LitVar(pLits[i]), 1 );
-    Gip_SolverAddClauseTag( p, pLits, nLits, GIP_CLA_LEMMA, Id >= 0 ? (((unsigned)Id << 1) | 1) : ((unsigned)GIP_FRAME_INF << 1) );
+    if ( Gip_SolverAddClauseTag( p, pLits, nLits, GIP_CLA_LEMMA, Id >= 0 ? (((unsigned)Id << 1) | 1) : ((unsigned)GIP_FRAME_INF << 1) ) != GIP_CREF_NONE )
+        Gip_SolverJftrLemmaAdded( p );
 }
 void Gip_SolverAddLemma( Gip_Solver_t * p, int * pLits, int nLits )
 {
@@ -770,7 +787,7 @@ void Gip_SolverSetLemFrames( Gip_Solver_t * p, Vec_Int_t * vLemFrame )
 static int Gip_SolverNewRound( Gip_Solver_t * p, Vec_Int_t * vSeeds,
                                int ** ppCstCls, int * pnCstLits, int nCst, int fBucket )
 {
-    int c, i;
+    int c, i, Cref;
     Gip_SolverBacktrack( p, 0, p->fTempDomain );
     Gip_SolverCleanTemporary( p );
     if ( !p->fTrivialUnsat )
@@ -812,7 +829,13 @@ static int Gip_SolverNewRound( Gip_Solver_t * p, Vec_Int_t * vSeeds,
             for ( i = 0; i < pnCstLits[c]; i++ )
                 if ( Gip_SolverLitValue(p, ppCstCls[c][i]) == GIP_FALSE && p->pTag0[Gip_LitVar(ppCstCls[c][i])] < Frame )
                     Frame = p->pTag0[Gip_LitVar(ppCstCls[c][i])];
-            Gip_SolverAttachClauseTag( p, Vec_IntArray(p->vSimpCls), Vec_IntSize(p->vSimpCls), GIP_CLA_TEMPORARY, (unsigned)Frame << 1 );
+            Cref = Gip_SolverAttachClauseTag( p, Vec_IntArray(p->vSimpCls), Vec_IntSize(p->vSimpCls), GIP_CLA_TEMPORARY, (unsigned)Frame << 1 );
+            if ( p->Jftr.nConf > 0 )
+            {
+                // the jftr mode reads the constraint clauses of the round
+                Vec_IntPush( p->Jftr.vCst, Cref );
+                Vec_IntPush( p->Jftr.vCstWit, -1 );
+            }
         }
     }
     if ( !p->fTempDomain )
@@ -968,6 +991,23 @@ int Gip_SolverSolve( Gip_Solver_t * p,
     int fResume = fFixed && Vec_IntSize(pBatch->vPrevious) &&
         Vec_IntSize(pBatch->vClause) == pnCstLits[0] &&
         !memcmp(Vec_IntArray(pBatch->vClause), ppCstCls[0], sizeof(int) * pnCstLits[0]);
+    // A solve that ended inside the jftr mode left its trail (an early answer is read from it). It is retired while the mode is
+    // still marked active, so that its literals are not saved as phases. No resume is pending then: a batch starts with an
+    // empty prefix, and a solve inside a batch never uses the mode (below).
+    assert( !fResume || !p->Jftr.fActive );
+    if ( p->Jftr.fActive )
+    {
+        Gip_SolverBacktrack( p, 0, p->fTempDomain );
+        p->Jftr.fActive = 0;
+    }
+    // The answer of the previous solve ends here, and the request is consumed on every path: a solve uses the mode only if its
+    // caller requested it right before (Gip_SolverSetJftr). A request made while a batch exists is ignored: a resumed solve
+    // keeps a trail prefix and skips the round setup, which the mode does not support.
+    p->Jftr.fEarly = p->Jftr.fWalkClosed = 0;
+    p->Jftr.nConf   = pBatch ? 0 : p->Jftr.nReqConf;
+    p->Jftr.fLeaves = pBatch ? 0 : p->Jftr.fReqWalk;
+    p->Jftr.fShrink = pBatch ? 0 : p->Jftr.fReqShrink;
+    p->Jftr.nReqConf = p->Jftr.fReqWalk = p->Jftr.fReqShrink = 0;
     p->fCanceled = 0;
     p->nConfCounted = p->Stats.nConflicts;
     p->fInputAbandoned = 0;
@@ -1064,6 +1104,8 @@ assumptions:
         Gip_SolverCleanLearnt( p, 1 );
         Gip_SolverSimplify( p );
     }
+    if ( p->Jftr.nConf > 0 )
+        Gip_SolverJftrStart( p, pUse, nUse );
     res = Gip_SolverSearchWithRestart( p, pUse, nUse, nRestartLimit );
     if ( fFixed && res != GIP_UNDEF && !p->fTrivialUnsat )
     {
@@ -1096,7 +1138,9 @@ assumptions:
             assert( (p->pLitVal[2*i] & 3) == p->pValue[i] );
             assert( (p->pLitVal[2*i+1] & 3) == (p->pValue[i] == GIP_NONE ? GIP_NONE : p->pValue[i] ^ 1) );
         }
-    if ( res == GIP_SAT && ((p->fJustify && Gip_SolverOption(p, "PDR2_JUSTIFY_CHECK")) ||
+    // upstream's check of a partial model is for the plain search's models only: an early answer of the jftr mode has a different
+    // contract, which the jftr checks verify, see JFTR MODE in gipSearch.c
+    if ( res == GIP_SAT && !p->Jftr.fEarly && ((p->fJustify && Gip_SolverOption(p, "PDR2_JUSTIFY_CHECK")) ||
                             (p->fInputDecisions && Gip_SolverOption(p, "PDR2_INPUT_CHECK"))) )
         Gip_SolverCheckPartialModel( p, pUse, nUse );
     if ( p->pDumpFile )
