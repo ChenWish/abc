@@ -116,6 +116,8 @@ struct Pdr2_Par_t_
     int fSilent;          // totally silent execution
     int RunId;            // identifier passed to the termination callback
     int (*pFuncStop)(int); // cooperative termination callback (NULL = none)
+    int nJftrBudget;      // conflict budget of the jftr (justification frontier) search of SAT queries (PDR2_JFTR_CONFL; 0 = off)
+    int nJftrKinds;       // query kinds that use the jftr search (PDR2_JFTR_KINDS; bit mask, 63 = all)
     int nPropUnit;        // solver propagations per nominal second (0 = the default, 12 M; small values let tests reach the slice ends and restarts)
     ABC_INT64_T nPropLimit; // soft propagation budget (0 = unlimited; a nonzero budget skips BMC)
                            // the in-flight obligation can use one extra slice before stopping

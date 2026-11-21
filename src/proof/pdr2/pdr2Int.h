@@ -114,6 +114,29 @@ typedef struct Pdr2_LiftMemo_t_
     int nKey, nCore;
     int Lits[1];
 } Pdr2_LiftMemo_t;
+// The requested jftr treatment of a query (PDR2_JFTR_CONFL, see JFTR MODE in gipSearch.c), passed by the caller of the query down to
+// Pdr2_ManSatSolve, next to upstream's QueryKind mask. It is a request, not a classification of the consumers: the PRED requests are
+// deliberately conservative (every query whose model may reach a predecessor extraction asks for the walk, and some whose consumers
+// only read the completion do too). Whether the mode is then used depends on the solver
+// (Pdr2_ManJftrEligible); otherwise, and with the budget 0, the query is the plain search.
+enum {
+    PDR2_JFTR_NONE = 0,        // the plain search (lifting, containment, checks, verification, ...)
+    PDR2_JFTR_ANSWER,          // the mode; the answer is used as yes / no, or read through the register completion (push, propagation)
+    PDR2_JFTR_PRED,            // the mode with the justification walk: the model may become a predecessor (MIC, CTG, inf)
+    PDR2_JFTR_PRED_SHRINK      // the walk and the shrink to the leaves of the walk (block and bad queries, and a propagation query
+                               // whose model goes to the predecessor extraction of PDR2_CTP)
+};
+// The query kinds of the mask PDR2_JFTR_KINDS: bit (1 << PDR2_JQ_*) selects a kind (default 63 = all). Every call site that requests
+// the mode names its kind through Pdr2_ManJftrReq, which turns the request of a deselected kind into PDR2_JFTR_NONE. The bit
+// assignments are part of the option's interface: keep them stable (a new kind gets the next bit).
+enum {
+    PDR2_JQ_BLOCK = 0,         //  1: the query that blocks a proof obligation (short prefix and full cube)
+    PDR2_JQ_BAD,               //  2: the bad-state query
+    PDR2_JQ_MIC,               //  4: the generalization queries (down, CTG, ctg_down, treb, parent prediction, blocking a CTP)
+    PDR2_JQ_PUSH,              //  8: the push of a new lemma
+    PDR2_JQ_PROP,              // 16: the propagation query
+    PDR2_JQ_INF                // 32: promotion and propagation to infinity
+};
 
 struct Pdr2_Man_t_
 {
@@ -412,7 +435,28 @@ static inline word         Pdr2_LitSign( int Lit )                        { retu
 static inline Gip_Solver_t * Pdr2_SolverActual( Gip_Solver_t * pSat )    { return pSat->pShared ? pSat->pShared : pSat; }
 static inline int          Pdr2_SolverValue( Gip_Solver_t * pSat, int v ) { return Pdr2_SolverActual(pSat)->pValue[v]; }
 static inline int          Pdr2_SolverFlip( Gip_Solver_t * pSat, int v ) { return Gip_SolverFlipToNone(Pdr2_SolverActual(pSat), v); }
-static inline int          Pdr2_ManLitValue( Pdr2_Man_t * p, Gip_Solver_t * pSat, int Lit ) { return Gip_SolverLitValue( Pdr2_SolverActual(pSat), Pdr2_LitLo(p, Lit) ); }
+// the value of a register in the last model: the state the consumers (keep tests, joins, recorded predecessors) see
+static inline int          Pdr2_ManVarValue( Pdr2_Man_t * p, Gip_Solver_t * pSat, int Var )
+{
+    Gip_Solver_t * pAct = Pdr2_SolverActual( pSat );
+    int Value = pAct->pValue[Var];
+    if ( Value == GIP_NONE && pAct->Jftr.fEarly && pAct->pCtx->pLoIdx[Var] >= 0 )
+        Value = Gip_SolverCoverValue( pAct, Var );   // the answer is the assignment completed by the solver's register completion, which
+                                                     // was fixed before a shrink; valid until the next solve starts or another operation changes the
+                                                     // assignment or the formula, like the assignment itself
+    return Value;
+}
+static inline int          Pdr2_ManLitValue( Pdr2_Man_t * p, Gip_Solver_t * pSat, int Lit )
+{
+    Gip_Solver_t * pAct = Pdr2_SolverActual( pSat );
+    int LitLo = Pdr2_LitLo( p, Lit ), Value;
+    if ( !pAct->Jftr.fEarly )
+        return Gip_SolverLitValue( pAct, LitLo );
+    Value = Pdr2_ManVarValue( p, pAct, Gip_LitVar(LitLo) );
+    return Value == GIP_NONE ? GIP_NONE : (Value == GIP_TRUE) ^ Gip_LitCompl(LitLo) ? GIP_TRUE : GIP_FALSE;
+}
+// the jftr request of a query of kind Kind (PDR2_JQ_*): Request, or the plain search when PDR2_JFTR_KINDS deselects the kind
+static inline int          Pdr2_ManJftrReq( Pdr2_Man_t * p, int Kind, int Request ) { return ((p->pPars->nJftrKinds >> Kind) & 1) ? Request : PDR2_JFTR_NONE; }
 // a flop literal excludes the initial states iff its flop has a defined initial value opposite to it
 // (a literal of a don't-care flop never does); a cube intersects them iff no literal excludes them
 static inline int          Pdr2_ManLitIsNonInit( Pdr2_Man_t * p, int Lit ) { return p->pInit[Abc_Lit2Var(Lit)] == Abc_LitIsCompl(Lit);    }
@@ -470,14 +514,16 @@ extern int                Pdr2_ManVerifyInvariant( Pdr2_Man_t * p );
 extern int                Pdr2_ManDumpInvariant( Pdr2_Man_t * p, int fTransformed );
 extern void               Pdr2_ManPrintProgress( Pdr2_Man_t * p, int fForce );
 extern void               Pdr2_ManPrintStats( Pdr2_Man_t * p );
+extern void               Pdr2_ManPrintJftrChecks( Pdr2_Man_t ** pMan, int nMan );
 extern int                Pdr2_ManTimedOut( Pdr2_Man_t * p );
 extern int                Pdr2_ManReachContains( Pdr2_Man_t * p, int Frame, Vec_Int_t * vCube );
 extern int                Pdr2_ManReachTryCex( Pdr2_Man_t * p, Pdr2_Obl_t * pObl );
 // pdr2Sat.c
 extern Gip_Solver_t *     Pdr2_ManNewSolver( Pdr2_Man_t * p, int k );
 extern void               Pdr2_ManSolverAddLemma( Pdr2_Man_t * p, Gip_Solver_t * pSat, Pdr2_Cube_t * pCube, int Id );
-extern int                Pdr2_ManSolveRelative( Pdr2_Man_t * p, Gip_Solver_t * pSat, Vec_Int_t * vCube, int fStrengthen, Vec_Int_t * vCstCls );
-extern int                Pdr2_ManTryDrop( Pdr2_Man_t * p, Gip_Solver_t * pSat, Vec_Int_t * vCube, int fStrengthen, Vec_Int_t * vCstCls );
+extern int                Pdr2_ManSolveRelative( Pdr2_Man_t * p, Gip_Solver_t * pSat, Vec_Int_t * vCube, int fStrengthen, Vec_Int_t * vCstCls, int Jftr );
+extern int                Pdr2_ManTryDrop( Pdr2_Man_t * p, Gip_Solver_t * pSat, Vec_Int_t * vCube, int fStrengthen, Vec_Int_t * vCstCls, int Jftr );
+extern int                Pdr2_ManJftrEligible( Pdr2_Man_t * p, Gip_Solver_t * pSat );
 extern int                Pdr2_ManSolveBad( Pdr2_Man_t * p );
 extern int                Pdr2_ManSolveContained( Pdr2_Man_t * p, Gip_Solver_t * pSat, Pdr2_Cube_t * pCube );
 extern int                Pdr2_ManInductiveCore( Pdr2_Man_t * p, Gip_Solver_t * pSat, Vec_Int_t * vCore );

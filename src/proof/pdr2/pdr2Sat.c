@@ -57,10 +57,59 @@ static void Pdr2_ManCheckSharedQuery( Pdr2_Man_t * p, int Frame, int Result,
     Gip_SolverFree( pCheck );
 }
 
+/**Function*************************************************************
+
+  Synopsis    [Decides whether a solver of the manager may use the jftr mode.]
+
+  Description [Checks the compatibility of the manager, its context and
+  the solver with the jftr mode (see JFTR MODE in gipSearch.c), on their
+  effective configuration: after every initialization override and after
+  the per-query policy adjustments of Pdr2_ManSatSolve. pSat is a frame
+  handle or an actual solver; NULL asks for the manager and its context
+  alone. Where it returns 0, every query is the plain search: a
+  correctness boundary, not a tuning choice. The budget (PDR2_JFTR_CONFL)
+  is not part of it.]
+
+***********************************************************************/
+int Pdr2_ManJftrEligible( Pdr2_Man_t * p, Gip_Solver_t * pSat )
+{
+    Gip_Ctx_t * pCtx = p->pCtx;
+    // the manager: an initial-state predicate asserts a unit over a register input (also the reverse search, which runs with it);
+    // a shared solver (any mode) adds activation vars to the context and guarded property clauses; the alternative predecessor
+    // extractions bypass or short-cut the walk-based extraction of an early answer
+    if ( p->pPars->nInitLiReg || p->pInitSat || p->GuardLit >= 0 )
+        return 0;
+    if ( p->nSharedSlots || p->pShared )
+        return 0;
+    if ( p->nCnfJustMode || p->nLiftMemoMode )
+        return 0;
+    // the context: Cnf_DeriveOther's CNF as derived, var == object id, nothing beyond the objects
+    if ( !pCtx->fJftrCnf || pCtx->pObj2Var || pCtx->iUnusedPiVar >= 0 || pCtx->nVars != Aig_ManObjNumMax(pCtx->pAig) )
+        return 0;
+    if ( pSat == NULL )
+        return 1;
+    // the solver: its own ordinary solver (not a handle of the shared solver, not the private bad-state solver, not a copy or a
+    // warm-started solver, not lazily loaded), no recycling, and none of the plain search's own partial-model policies in this query
+    if ( pSat->pShared || pSat == p->pBadRoot || pSat->pCtx != pCtx )
+        return 0;
+    if ( pSat->Jftr.fCopied || pSat->pLoaded || pSat->nRecycleMode || pSat->fJustify || pSat->fInputDecisions )
+        return 0;
+    return 1;
+}
+
+// the jftr request of one physical solve: set before every Gip_SolverSolve of the wrapper (budget 0 = the plain search), so that no
+// solve inherits the activation of an earlier one (the solver consumes the request in any case)
+static inline void Pdr2_ManSatSetJftr( Pdr2_Man_t * p, Gip_Solver_t * pHandle, int Jftr )
+{
+    int fUse = Jftr != PDR2_JFTR_NONE && p->pPars->nJftrBudget > 0 && Pdr2_ManJftrEligible( p, pHandle );
+    Gip_SolverSetJftr( Pdr2_SolverActual(pHandle), fUse ? p->pPars->nJftrBudget : 0,
+        fUse && (Jftr == PDR2_JFTR_PRED || Jftr == PDR2_JFTR_PRED_SHRINK), fUse && Jftr == PDR2_JFTR_PRED_SHRINK );
+}
+
 // runs one SAT query and accounts for its cost (the propagation count is the deterministic
-// measure of work used by the level restarts)
+// measure of work used by the level restarts); Jftr is the requested jftr treatment (PDR2_JFTR_*)
 static void Pdr2_ManSeedPhases( Pdr2_Man_t * p, Gip_Solver_t * pSat, int Frame, int Mode );
-static inline int Pdr2_ManSatSolve( Pdr2_Man_t * p, Gip_Solver_t * pSat, int * pLits, int nLits, int ** pCst, int * nCst, int nC, int QueryKind, int nDropConfs )
+static inline int Pdr2_ManSatSolve( Pdr2_Man_t * p, Gip_Solver_t * pSat, int * pLits, int nLits, int ** pCst, int * nCst, int nC, int QueryKind, int nDropConfs, int Jftr )
 {
     Gip_Solver_t * pHandle = pSat;
     pSat = Pdr2_SolverActual( pSat );
@@ -156,6 +205,8 @@ static inline int Pdr2_ManSatSolve( Pdr2_Man_t * p, Gip_Solver_t * pSat, int * p
     else
         pSat->nPropLimit = 0;
     p->nSolves++;
+    // the request is evaluated here, after the resolution of the actual solver and the per-query policy adjustments above
+    Pdr2_ManSatSetJftr( p, pHandle, Jftr );
     RetValue = Gip_SolverSolve( pSat, pLits, nLits, pCst, nCst, nC, -1 );
     if ( RetValue == GIP_UNDEF && p->fBadPhaseProbe && pSat->nConfLimit > 0 &&
          pSat->Stats.nConflicts >= pSat->nConfCounted + pSat->nConfLimit &&
@@ -180,6 +231,7 @@ static inline int Pdr2_ManSatSolve( Pdr2_Man_t * p, Gip_Solver_t * pSat, int * p
         Pdr2_ManSeedPhases(p, pSat, Pdr2_ManLevel(p), 2);
         pSat->nConfLimit = 0;
         p->nBadRephases++; p->nSolves++;
+        Pdr2_ManSatSetJftr( p, pHandle, Jftr );   // a fresh request: each physical solve has its own budget and answer state
         RetValue = Gip_SolverSolve(pSat, pLits, nLits, pCst, nCst, nC, -1);
     }
     pSat->nConfLimit = 0;
@@ -391,6 +443,8 @@ Gip_Solver_t * Pdr2_ManNewSolver( Pdr2_Man_t * p, int Type )
         Gip_SolverAddLemmaId(pSat, &p->GuardLo, 1, -1);
         if ( p->GuardLi >= 0 ) Gip_SolverAddLemmaId(pSat, &p->GuardLi, 1, -1);
     }
+    // the level of the debug checks of the jftr mode; they run only where the mode is in use, see Pdr2_ManJftrEligible
+    pSat->Jftr.fVerify = Gip_OptionGet("PDR2_JFTR_CHECK") ? Abc_MaxInt(0, atoi(Gip_OptionGet("PDR2_JFTR_CHECK"))) : 0;
     if ( Type == 1 )
     {
         int i, Lit;
@@ -584,7 +638,7 @@ void Pdr2_ManSolverAddUnit( Pdr2_Man_t * p, Gip_Solver_t * pSat, int Lit )
   SeeAlso     []
 
 ***********************************************************************/
-static int Pdr2_ManSolveRelativeLimit( Pdr2_Man_t * p, Gip_Solver_t * pSat, Vec_Int_t * vCube, int fStrengthen, Vec_Int_t * vCstCls, int nDropConfs )
+static int Pdr2_ManSolveRelativeLimit( Pdr2_Man_t * p, Gip_Solver_t * pSat, Vec_Int_t * vCube, int fStrengthen, Vec_Int_t * vCstCls, int nDropConfs, int Jftr )
 {
     int * pCst[2], nCst[2], nC = 0;
     int i, Lit, RetValue;
@@ -603,7 +657,7 @@ static int Pdr2_ManSolveRelativeLimit( Pdr2_Man_t * p, Gip_Solver_t * pSat, Vec_
         // clause. An UNSAT result without that clause proves a stronger fact.
         p->nStrengthenTrials++;
         RetValue = Pdr2_ManSatSolve(p, pSat, Vec_IntArray(p->vAssump), Vec_IntSize(p->vAssump),
-                                    NULL, NULL, 0, p->fInputBlockQuery ? 2 : 4, nDropConfs);
+                                    NULL, NULL, 0, p->fInputBlockQuery ? 2 : 4, nDropConfs, PDR2_JFTR_NONE);
         if ( RetValue == GIP_UNDEF ) return -1;
         if ( RetValue == GIP_UNSAT ) { p->nStrengthenAvoided++; return 1; }
         Vec_IntForEachEntry(vCube, Lit, i)
@@ -631,7 +685,7 @@ static int Pdr2_ManSolveRelativeLimit( Pdr2_Man_t * p, Gip_Solver_t * pSat, Vec_
         nCst[nC] = Vec_IntSize( p->vCst2 );
         nC++;
     }
-    RetValue = Pdr2_ManSatSolve( p, pSat, Vec_IntArray(p->vAssump), Vec_IntSize(p->vAssump), pCst, nCst, nC, p->fInputBlockQuery ? 2 : 4, nDropConfs );
+    RetValue = Pdr2_ManSatSolve( p, pSat, Vec_IntArray(p->vAssump), Vec_IntSize(p->vAssump), pCst, nCst, nC, p->fInputBlockQuery ? 2 : 4, nDropConfs, Jftr );
     if ( RetValue == GIP_UNSAT )
         return 1;
     if ( RetValue == GIP_SAT )
@@ -639,15 +693,15 @@ static int Pdr2_ManSolveRelativeLimit( Pdr2_Man_t * p, Gip_Solver_t * pSat, Vec_
     return -1;
 }
 
-int Pdr2_ManSolveRelative( Pdr2_Man_t * p, Gip_Solver_t * pSat, Vec_Int_t * vCube, int fStrengthen, Vec_Int_t * vCstCls )
+int Pdr2_ManSolveRelative( Pdr2_Man_t * p, Gip_Solver_t * pSat, Vec_Int_t * vCube, int fStrengthen, Vec_Int_t * vCstCls, int Jftr )
 {
-    return Pdr2_ManSolveRelativeLimit( p, pSat, vCube, fStrengthen, vCstCls, 0 );
+    return Pdr2_ManSolveRelativeLimit( p, pSat, vCube, fStrengthen, vCstCls, 0, Jftr );
 }
 
 // Optional minimization may keep its last proved cube when a trial times out.
-int Pdr2_ManTryDrop( Pdr2_Man_t * p, Gip_Solver_t * pSat, Vec_Int_t * vCube, int fStrengthen, Vec_Int_t * vCstCls )
+int Pdr2_ManTryDrop( Pdr2_Man_t * p, Gip_Solver_t * pSat, Vec_Int_t * vCube, int fStrengthen, Vec_Int_t * vCstCls, int Jftr )
 {
-    return Pdr2_ManSolveRelativeLimit( p, pSat, vCube, fStrengthen, vCstCls, p->nDropConfLimit );
+    return Pdr2_ManSolveRelativeLimit( p, pSat, vCube, fStrengthen, vCstCls, p->nDropConfLimit, Jftr );
 }
 
 /**Function*************************************************************
@@ -655,7 +709,7 @@ int Pdr2_ManTryDrop( Pdr2_Man_t * p, Gip_Solver_t * pSat, Vec_Int_t * vCube, int
   Synopsis    [Tries a cut-mapped solver when a frontier query runs out of conflicts.]
 
 ***********************************************************************/
-static int Pdr2_ManSolveBadMapped( Pdr2_Man_t * p, Gip_Solver_t * pSat, int Lit, int Seconds )
+static int Pdr2_ManSolveBadMapped( Pdr2_Man_t * p, Gip_Solver_t * pSat, int Lit, int Seconds, int Jftr )
 {
     const char * pOption = Gip_OptionGet("PDR2_BAD_MAPPED_CONFS");
     int Limit = pOption ? Abc_MaxInt(0, atoi(pOption)) : 512;
@@ -664,7 +718,7 @@ static int Pdr2_ManSolveBadMapped( Pdr2_Man_t * p, Gip_Solver_t * pSat, int Lit,
     if ( Limit )
     {
         ABC_INT64_T Cuts = p->nDropConfCuts;
-        Ret = Pdr2_ManSatSolve(p, pSat, &Lit, 1, NULL, NULL, 0, 1, Limit);
+        Ret = Pdr2_ManSatSolve(p, pSat, &Lit, 1, NULL, NULL, 0, 1, Limit, Jftr);
         if ( Ret != GIP_UNDEF || p->nDropConfCuts == Cuts ) return Ret;
         p->nDropConfCuts = Cuts;
     }
@@ -688,7 +742,7 @@ static int Pdr2_ManSolveBadMapped( Pdr2_Man_t * p, Gip_Solver_t * pSat, int Lit,
         }
         // Lifting consumes the frame solver's model and the original bad
         // literal in vLastAssump. Use the CI assignments for this call only.
-        Ret = Pdr2_ManSatSolve(p, pSat, Vec_IntArray(vFixed), Vec_IntSize(vFixed), NULL, NULL, 0, 1, 0);
+        Ret = Pdr2_ManSatSolve(p, pSat, Vec_IntArray(vFixed), Vec_IntSize(vFixed), NULL, NULL, 0, 1, 0, PDR2_JFTR_NONE);
         Vec_IntFree(vFixed);
         if ( Ret != GIP_UNSAT )
         {
@@ -698,7 +752,7 @@ static int Pdr2_ManSolveBadMapped( Pdr2_Man_t * p, Gip_Solver_t * pSat, int Lit,
     }
     Vec_IntFree(vModel);
     if ( Pdr2_ManPastDeadline(p) ) return GIP_UNDEF;
-    return Pdr2_ManSatSolve(p, pSat, &Lit, 1, NULL, NULL, 0, 1, 0);
+    return Pdr2_ManSatSolve(p, pSat, &Lit, 1, NULL, NULL, 0, 1, 0, Jftr);
 }
 
 /**Function*************************************************************
@@ -717,6 +771,7 @@ int Pdr2_ManSolveBad( Pdr2_Man_t * p )
 {
     Gip_Solver_t * pSat = Pdr2_ManSolver( p, Pdr2_ManLevel(p) );
     int Lit = Abc_Var2Lit( p->VarBad, 0 ), RetValue;
+    int Jftr = Pdr2_ManJftrReq( p, PDR2_JQ_BAD, PDR2_JFTR_PRED_SHRINK );
     const char * pPrefix = Gip_OptionGet( "PDR2_DUMP_BAD" );
     const char * pMapped = Gip_OptionGet( "PDR2_BAD_MAPPED_SECS" );
     char FileName[4096];
@@ -768,9 +823,9 @@ int Pdr2_ManSolveBad( Pdr2_Man_t * p )
          !p->pPars->nPropLimit && !p->propLimit && !p->propSlice && !p->nSharedSlots &&
          !p->nBadRootMode && !p->fBadPhaseProbe && !pPrefix &&
          !Aig_ManBufNum(p->pAig) && !Aig_ManExorNum(p->pAig) )
-        RetValue = Pdr2_ManSolveBadMapped(p, pSat, Lit, Abc_MinInt(60, atoi(pMapped)));
+        RetValue = Pdr2_ManSolveBadMapped(p, pSat, Lit, Abc_MinInt(60, atoi(pMapped)), Jftr);
     else
-        RetValue = Pdr2_ManSatSolve( p, pSat, &Lit, 1, NULL, NULL, 0, 1, 0 );
+        RetValue = Pdr2_ManSatSolve( p, pSat, &Lit, 1, NULL, NULL, 0, 1, 0, Jftr );
     if ( pSat == p->pBadRoot && Gip_OptionGet("PDR2_BADROOT_CHECK") )
         Pdr2_ManCheckSharedQuery(p, Pdr2_ManLevel(p), RetValue, &Lit, 1, NULL, NULL, 0);
     p->fBadPhaseProbe = 0;
@@ -803,7 +858,7 @@ int Pdr2_ManSolveContained( Pdr2_Man_t * p, Gip_Solver_t * pSat, Pdr2_Cube_t * p
     Vec_IntClear( p->vLastAssump );
     Vec_IntAppend( p->vLastAssump, p->vAssump );
     p->pLastSolver = pSat;
-    RetValue = Pdr2_ManSatSolve( p, pSat, Vec_IntArray(p->vAssump), Vec_IntSize(p->vAssump), NULL, NULL, 0, 16, 0 );
+    RetValue = Pdr2_ManSatSolve( p, pSat, Vec_IntArray(p->vAssump), Vec_IntSize(p->vAssump), NULL, NULL, 0, 16, 0, PDR2_JFTR_NONE );
     if ( RetValue == GIP_UNSAT )
         return 1;
     if ( RetValue == GIP_SAT )
@@ -910,6 +965,11 @@ void Pdr2_ManMicCexStore( Pdr2_Man_t * p, Gip_Solver_t * pSat, int Frame )
     word Bit = (word)1 << (Slot & 63);
     pSat = Pdr2_SolverActual( pSat );
     assert( !p->fAbsActive );
+    // an early answer of the jftr mode, pSat->Jftr.fEarly: both the source and the successor are stored raw, an unassigned value as
+    // unknown, never the register completion for the source. The raw source is the assigned part of the completed state, which is a
+    // model of the frame, so it is a partial source as the cache already handles them; the assigned register inputs of the domain are
+    // closed nodes, forced by the assigned leaves, so they are the successor of every completion. Storing the raw values keeps the
+    // representation of the cache as it is for partial sources.
     for ( i = 0; i < p->nRegs; i++ )
     {
         word * b = p->pMicCexBits + 8 * i;
@@ -1238,11 +1298,24 @@ void Pdr2_ManGetPred( Pdr2_Man_t * p, int fStrengthen, Vec_Int_t * vCube, Vec_In
     abctime clk = Abc_Clock();
     int i, k, j, nCis, Lit, Var, Value, Iter, nOld, RetValue, nCone = 0, nFlip, nSim;
     int * pCls, nCls, fMemoProved = 0, fCnfJust = 0;
+    // the manager and its context are compatible with the mode: enables the debug check of full models below
+    int fJftrMan = p->pPars->nJftrBudget > 0 && Pdr2_ManJftrEligible( p, NULL );
     if ( p->GuardLo >= 0 ) Vec_IntPushUnique(p->vLastAssump, p->GuardLo);
     if ( p->GuardLi >= 0 ) Vec_IntPushUnique(p->vLastAssump, p->GuardLi);
+    if ( pModel->Jftr.fEarly && !pModel->Jftr.fWalkClosed )
+    {
+        // the extraction of an early answer needs its transition-only certificate; the request of the model's solve is printed:
+        // walk = PDR2_JFTR_PRED or _PRED_SHRINK was requested, shrink = PDR2_JFTR_PRED_SHRINK
+        Abc_Print( 1, "Pdr2_ManGetPred(): Internal error: an early answer without a closed justification walk reached the predecessor extraction (request: walk %d, shrink %d).\n", pModel->Jftr.fLeaves, pModel->Jftr.fShrink );
+        fflush( stdout );
+        fprintf( stderr, "Pdr2_ManGetPred(): Internal error: an uncertified early answer reached the predecessor extraction.\n" );
+        abort();
+    }
     Vec_IntClear( vCube );
     Vec_IntClear( vInputs );
-    if ( p->nLiftMemoMode )
+    // an early answer of the jftr mode is never matched against the memo, whose lookup reads the model's assigned values; the mode
+    // is not used with the memo, see Pdr2_ManJftrEligible, but this does not rely on that
+    if ( p->nLiftMemoMode && !pModel->Jftr.fEarly )
     {
         Pdr2_LiftMemo_t * pMemo = Pdr2_ManLiftMemoFind( p, pModel );
         if ( pMemo )
@@ -1281,7 +1354,8 @@ void Pdr2_ManGetPred( Pdr2_Man_t * p, int fStrengthen, Vec_Int_t * vCube, Vec_In
     // Inputs outside the target cone cannot affect the lifted implication.
     // Set the lifting domain before collecting the model's input premises.
     Gip_SolverSetDomain( p->pLift, Vec_IntArray(p->vLift3), Vec_IntSize(p->vLift3) );
-    if ( p->nCnfJustMode && (p->nCnfJustMode != 3 || (pModel->fInputDecisions && !pModel->fInputAbandoned)) &&
+    // the CNF justification needs a model that assigns the whole cone; an early answer of the jftr mode goes the walk-based way
+    if ( p->nCnfJustMode && !pModel->Jftr.fEarly && (p->nCnfJustMode != 3 || (pModel->fInputDecisions && !pModel->fInputAbandoned)) &&
          Pdr2_ManCnfJustify(p, pModel, vCube, vInputs) )
     {
         fCnfJust = 1;
@@ -1321,6 +1395,8 @@ void Pdr2_ManGetPred( Pdr2_Man_t * p, int fStrengthen, Vec_Int_t * vCube, Vec_In
         Var = p->pLoVar[i];
         if ( !Gip_DomainHas( &p->pLift->Domain, Var ) )
             continue;
+        // the predecessor cube is built from the assigned registers only -- the completion of an early answer is for the
+        // consumers that read a state
         Value = pModel->pValue[Var];
         if ( Value == GIP_NONE )
             continue;
@@ -1328,10 +1404,15 @@ void Pdr2_ManGetPred( Pdr2_Man_t * p, int fStrengthen, Vec_Int_t * vCube, Vec_In
         nCone++;
         // (with the weakening by simulation the latches keep their model values: the cube must
         // contain the model state, or the obligation may be one the frames already exclude)
-        if ( p->pPars->fLift && !p->pPars->nLiftSim && !p->pVarMark[Var] && Gip_SolverFlipToNone( pModel, Var ) )
+        // the watched-clause deletion test of flip-to-none does not apply to the contract of an early answer of the jftr mode: its
+        // certified premises are retained
+        if ( p->pPars->fLift && !p->pPars->nLiftSim && !p->pVarMark[Var] && !pModel->Jftr.fEarly && Gip_SolverFlipToNone( pModel, Var ) )
             continue;
         Vec_IntPush( vCube, Abc_Var2Lit(i, Value == GIP_FALSE) );
     }
+    if ( pModel->Jftr.fVerify >= 2 && !pModel->Jftr.fEarly && fJftrMan && Pdr2_ManJftrEligible( p, p->pLastSolver ) )
+        Gip_JftrVerifyFlipped( pModel );   // debug: what flip-to-none released left every clause satisfied; a full model of a solver
+                                           // that may use the mode, never an upstream partial model, and only where the mode is in use
     p->nLiftCalls++;
     p->nLiftFlip += Vec_IntSize( vCube );
     nFlip = Vec_IntSize( vCube );
@@ -1347,12 +1428,13 @@ void Pdr2_ManGetPred( Pdr2_Man_t * p, int fStrengthen, Vec_Int_t * vCube, Vec_In
         // functionally (they are outside the lifting domain, which follows the CNF): those are
         // dropped afterwards, the implication of the targets does not need them
         Vec_IntClear( vCube );
-        vCis = Pdr2_ManLiftCis( p, pModel->vTrail, 1, 0 );
+        // an early answer: the completed registers are not on the trail, so the sparse scan of the trail would miss them
+        vCis = pModel->Jftr.fEarly ? NULL : Pdr2_ManLiftCis( p, pModel->vTrail, 1, 0 );
         nCis = vCis ? Vec_IntSize(vCis) : p->nRegs;
         for ( j = 0; j < nCis; j++ )
         {
             i = vCis ? Vec_IntEntry(vCis, j) : j;
-            Value = pModel->pValue[p->pLoVar[i]];
+            Value = Pdr2_ManVarValue( p, pModel, p->pLoVar[i] );   // an early answer: the simulation starts from the completed state
             if ( Value != GIP_NONE )
                 Vec_IntPush( vCube, Abc_Var2Lit(i, Value == GIP_FALSE) );
         }
@@ -1374,6 +1456,12 @@ void Pdr2_ManGetPred( Pdr2_Man_t * p, int fStrengthen, Vec_Int_t * vCube, Vec_In
             {
                 if ( p->nLiftSimBad++ == 0 && !p->pPars->fSilent )
                     Abc_Print( 1, "Pdr2_ManGetPred(): Warning: the weakened cube disagrees with the model.\n" );
+                if ( pModel->Jftr.nConf > 0 )   // the answer came from a solve that used the mode
+                {
+                    fflush( stdout );
+                    fprintf( stderr, "Pdr2_ManGetPred(): Internal error: the weakened cube disagrees with the model.\n" );
+                    abort();
+                }
                 break;
             }
         }
@@ -1384,7 +1472,10 @@ lift_ready:
     // minimal premise iterations
     pCls = Vec_IntArray( p->vLift3 );
     nCls = Vec_IntSize( p->vLift3 );
-    for ( Iter = 0; Vec_IntSize(vCube) > 0 && p->pPars->nLiftIters >= 0 && p->pPars->nLiftSim != 2 && (!fCnfJust || p->nCnfJustMode != 2); Iter++ )
+    // The lifting below is the predecessor generalization of the engine, the same with the mode on or off; it is not a check of
+    // the early answer, whose correctness rests on the invariants of the mode. Only the debugging mode PDR2_JFTR_CHECK adds a
+    // query: an early answer whose cube is empty is then checked once -- the inputs alone must imply the target.
+    for ( Iter = 0; (Vec_IntSize(vCube) > 0 || (Iter == 0 && pModel->Jftr.fEarly && pModel->Jftr.fVerify)) && p->pPars->nLiftIters >= 0 && p->pPars->nLiftSim != 2 && (!fCnfJust || p->nCnfJustMode != 2); Iter++ )
     {
         if ( Iter == 0 )
             Pdr2_ManSortByAct( p, vCube, 0 );
@@ -1397,12 +1488,21 @@ lift_ready:
         Vec_IntAppend( p->vLift2, p->vLift1 );
         Vec_IntForEachEntry( vCube, Lit, i )
             Vec_IntPush( p->vLift2, Pdr2_LitLo(p, Lit) );
-        RetValue = Pdr2_ManSatSolve( p, p->pLift, Vec_IntArray(p->vLift2), Vec_IntSize(p->vLift2), &pCls, &nCls, 1, 8, 0 );
+        RetValue = Pdr2_ManSatSolve( p, p->pLift, Vec_IntArray(p->vLift2), Vec_IntSize(p->vLift2), &pCls, &nCls, 1, 8, 0, PDR2_JFTR_NONE );
         if ( RetValue != GIP_UNSAT )
         {
             // on a timeout the current cube is kept: it still implies the target
             if ( RetValue == GIP_SAT && !p->pPars->fSilent )
                 Abc_Print( 1, "Pdr2_ManGetPred(): Internal error: the lifting query is SAT.\n" );
+            if ( RetValue == GIP_SAT && pModel->Jftr.nConf > 0 )   // the answer came from a solve that used the mode
+            {
+                // the state and the inputs taken from the model do not imply the target: the model is not a predecessor.
+                // With the jftr mode in use, returning the cube anyway would hand the engine a false premise, so the run stops
+                Abc_Print( 1, "Pdr2_ManGetPred(): the model does not imply its target (request: walk %d, shrink %d; early answer %d, cube %d).\n", pModel->Jftr.fLeaves, pModel->Jftr.fShrink, pModel->Jftr.fEarly, Vec_IntSize(vCube) );
+                fflush( stdout );
+                fprintf( stderr, "Pdr2_ManGetPred(): Internal error: the lifting query is SAT.\n" );
+                abort();
+            }
             break;
         }
         k = 0;

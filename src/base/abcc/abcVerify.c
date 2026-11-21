@@ -2766,6 +2766,8 @@ usage:
     Abc_Print( -2, "\t         PDR2_SHARED=1 share finite-frame SAT clauses using activation literals [default = 0]\n" );
     Abc_Print( -2, "\t         PDR2_REACH=1..256 reject drops covering sampled reachable states [default = 0]\n" );
     Abc_Print( -2, "\t         PDR2_LCORR=0|1 use latch-only correspondence with -q [default = 0]\n" );
+    Abc_Print( -2, "\t         PDR2_JFTR_CONFL=<num> conflict budget of the justification-frontier (jftr) search of SAT queries (0 = off; unsupported solver configurations use the ordinary search) [default = %d]\n", pPars->nJftrBudget );
+    Abc_Print( -2, "\t         PDR2_JFTR_KINDS=0..63 query kinds that use the jftr search when PDR2_JFTR_CONFL > 0, as a sum of 1 block, 2 bad state, 4 generalization, 8 push, 16 propagation, 32 infinity (55 = all but push) [default = %d]\n", pPars->nJftrKinds );
     return 1;
 }
 

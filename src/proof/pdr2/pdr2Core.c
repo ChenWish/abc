@@ -113,6 +113,8 @@ void Pdr2_ManSetDefaultParams( Pdr2_Par_t * pPars )
     pPars->fDynRun       =       Gip_OptionGet("PDR2_DYNRUN") ? atoi(Gip_OptionGet("PDR2_DYNRUN")) : 0;  // plain dynamic run (finished 0 of 76 IWLS and 0 of 111 mike4 examples)
     pPars->fSimRun       =       0;  // weakening by simulation as another alternating run
     pPars->nBmcTime      =       Gip_OptionGet("PDR2_BMC") ? atoi(Gip_OptionGet("PDR2_BMC")) : 2;  // BMC stage after the first slice
+    pPars->nJftrBudget   =       Gip_OptionGet("PDR2_JFTR_CONFL") ? Abc_MaxInt(0, atoi(Gip_OptionGet("PDR2_JFTR_CONFL"))) : 0;  // conflict budget of the jftr search of SAT queries (0 = off)
+    pPars->nJftrKinds    =       Gip_OptionGet("PDR2_JFTR_KINDS") ? Abc_MaxInt(0, Abc_MinInt(63, atoi(Gip_OptionGet("PDR2_JFTR_KINDS")))) : 63;  // query kinds that use the jftr search (bit mask, 63 = all)
     pPars->nAbsTime      =       8;  // first budget of the abstraction phases
     pPars->fTopCtg       =       0;  // CTG for top-level obligations (was unreachable in the measured runs)
     pPars->fInfPromote   =       0;  // immediate promotion to frame infinity
@@ -603,7 +605,7 @@ static void Pdr2_ManTimeGenCheck( Pdr2_Man_t * p, int iFrame, Vec_Int_t * vCube 
     int iSave = p->iCoreFrame, fQueryCut = p->fQueryCut, RetValue;
     p->nTgChecks++;
     p->propLimit = 0;
-    RetValue = Pdr2_ManSolveRelative( p, iFrame == -1 ? p->pInf : Pdr2_ManSolver(p, iFrame), vTmp, 1, NULL );
+    RetValue = Pdr2_ManSolveRelative( p, iFrame == -1 ? p->pInf : Pdr2_ManSolver(p, iFrame), vTmp, 1, NULL, PDR2_JFTR_NONE );
     if ( RetValue == 0 )
     {
         p->nTgFailed++;
@@ -648,7 +650,7 @@ static int Pdr2_ManPushLemma( Pdr2_Man_t * p, int iFrame, Vec_Int_t * vCube )
     p->fPushInf = 0;
     for ( i = iFrame + 1; i <= Pdr2_ManLevel(p); )
     {
-        RetValue = Pdr2_ManSolveRelative( p, Pdr2_ManSolver(p, i-1), vCube, 1, NULL );
+        RetValue = Pdr2_ManSolveRelative( p, Pdr2_ManSolver(p, i-1), vCube, 1, NULL, Pdr2_ManJftrReq(p, PDR2_JQ_PUSH, PDR2_JFTR_ANSWER) );
         if ( RetValue != 1 )
         {
             Result = i;
@@ -738,7 +740,7 @@ static int Pdr2_ManDown( Pdr2_Man_t * p, int iFrame, Vec_Int_t * vCube, char * p
         nTries++;
         p->nDownQueries++;
         if ( p->nDownMode && nTries > 1 ) p->nDownRetries++;
-        RetValue = Pdr2_ManTryDrop( p, pSat, vOrd, 1, vCst );
+        RetValue = Pdr2_ManTryDrop( p, pSat, vOrd, 1, vCst, Pdr2_ManJftrReq(p, PDR2_JQ_MIC, PDR2_JFTR_PRED) );
         if ( RetValue == -1 )
             break;
         if ( RetValue == 1 )
@@ -758,7 +760,7 @@ static int Pdr2_ManDown( Pdr2_Man_t * p, int iFrame, Vec_Int_t * vCube, char * p
                 Vec_IntForEachEntry(vFull, Lit, i)
                 {
                     Var = Abc_Lit2Var(Lit);
-                    Value = Pdr2_SolverValue(pSat, p->pLoVar[Var]);
+                    Value = Pdr2_ManVarValue(p, pSat, p->pLoVar[Var]);   // the completed source state, as in the store below
                     if ( Value != GIP_NONE ) Vec_IntPush(vOrd, Abc_Var2Lit(Var, Value == GIP_FALSE));
                     Value = Gip_SolverLitValue(Pdr2_SolverActual(pSat), p->pLiLit[Var]);
                     if ( Value != GIP_NONE ) Vec_IntPush(vTmp, Abc_Var2Lit(Var, Value == GIP_FALSE));
@@ -775,6 +777,9 @@ static int Pdr2_ManDown( Pdr2_Man_t * p, int iFrame, Vec_Int_t * vCube, char * p
         Vec_IntForEachEntry( vCur, Lit, i )
         {
             Value = Pdr2_ManLitValue( p, pSat, Lit );
+            // an early answer of the jftr mode leaves the registers it did not need unassigned: the value read here is
+            // then the one of the solver's register completion, never unassigned. The watched-clause deletion test of
+            // flip-to-none does not apply to the contract of an early answer: its certified premises are retained
             if ( pKeep[Lit] )
             {
                 if ( Value == GIP_TRUE )
@@ -785,7 +790,7 @@ static int Pdr2_ManDown( Pdr2_Man_t * p, int iFrame, Vec_Int_t * vCube, char * p
                     break;
                 }
             }
-            else if ( Value == GIP_TRUE && !Pdr2_SolverFlip( pSat, p->pLoVar[Abc_Lit2Var(Lit)] ) )
+            else if ( Value == GIP_TRUE && (Pdr2_SolverActual(pSat)->Jftr.fEarly || !Pdr2_SolverFlip( pSat, p->pLoVar[Abc_Lit2Var(Lit)] )) )
                 Vec_IntPush( vTmp, Lit );
         }
         Vec_IntClear( vCur );
@@ -798,16 +803,19 @@ static int Pdr2_ManDown( Pdr2_Man_t * p, int iFrame, Vec_Int_t * vCube, char * p
         Vec_IntForEachEntry( vFull, Lit, i )
         {
             Var = p->pLoVar[Abc_Lit2Var(Lit)];
-            Value = Pdr2_SolverValue( pSat, Var );
+            Value = Pdr2_ManVarValue( p, pSat, Var );   // an early answer: the recorded predecessor is the completed state the join used
             if ( Value != GIP_NONE )
             {
-                int fRemoved = Pdr2_SolverFlip( pSat, Var );
+                int fRemoved = Pdr2_SolverActual(pSat)->Jftr.fEarly ? 0 : Pdr2_SolverFlip( pSat, Var );   // no flip-to-none on an early answer, see above
                 if ( fRemoved == (p->pPars->nDownCacheMode == 1) )
                     Vec_IntPush( vTmp, Abc_Var2Lit(Abc_Lit2Var(Lit), Value == GIP_FALSE) );
             }
         }
         if ( p->pPars->nDownCacheMode != 2 )
             Vec_PtrPush( vCexS, Pdr2_CubeAllocVec( vTmp ) );
+        if ( Pdr2_SolverActual(pSat)->Jftr.fVerify >= 2 && !Pdr2_SolverActual(pSat)->Jftr.fEarly && p->pPars->nJftrBudget > 0 && Pdr2_ManJftrEligible( p, pSat ) )
+            Gip_JftrVerifyFlipped( Pdr2_SolverActual(pSat) );   // debug: what flip-to-none released left every clause satisfied; a full model of a
+                                                                // solver that may use the mode, only where the mode is in use
         Vec_IntClear( vTmp );
         Vec_IntForEachEntry( vFull, Lit, i )
         {
@@ -862,7 +870,7 @@ static int Pdr2_ManTrivialBlockRec( Pdr2_Man_t * p, int iFrame, Vec_Int_t * vLem
         Vec_IntClear( vOrd );
         Vec_IntAppend( vOrd, vLemma );
         Pdr2_ManSortByAct( p, vOrd, 0 );
-        RetValue = Pdr2_ManTryDrop( p, pSat, vOrd, 1, vCst );
+        RetValue = Pdr2_ManTryDrop( p, pSat, vOrd, 1, vCst, Pdr2_ManJftrReq(p, PDR2_JQ_MIC, PDR2_JFTR_PRED) );
         if ( RetValue == 1 )
         {
             if ( !Pdr2_ManInductiveCore( p, pSat, vMic ) )
@@ -934,7 +942,7 @@ static int Pdr2_ManCtgDown( Pdr2_Man_t * p, int iFrame, Vec_Int_t * vCube, char 
         Vec_IntClear( vOrd );
         Vec_IntAppend( vOrd, vCur );
         Pdr2_ManSortByAct( p, vOrd, 0 );
-        RetValue = Pdr2_ManTryDrop( p, pSat, vOrd, 1, NULL );
+        RetValue = Pdr2_ManTryDrop( p, pSat, vOrd, 1, NULL, Pdr2_ManJftrReq(p, PDR2_JQ_MIC, PDR2_JFTR_PRED) );
         if ( RetValue == -1 )
             break;
         if ( RetValue == 1 )
@@ -1224,7 +1232,7 @@ static void Pdr2_ManMicTreb( Pdr2_Man_t * p, int iFrame, Vec_Int_t * vCube )
                 if ( !Pdr2_LitsAreInit(p, vTry) )
                 {
                     Pdr2_ManSortByAct( p, vTry, 0 );
-                    RetValue = Pdr2_ManTryDrop( p, pSat, vTry, 1, NULL );
+                    RetValue = Pdr2_ManTryDrop( p, pSat, vTry, 1, NULL, Pdr2_ManJftrReq(p, PDR2_JQ_MIC, PDR2_JFTR_PRED) );
                     if ( RetValue == 1 && Pdr2_ManInductiveCore( p, pSat, vCore ) )
                     {
                         nFailed = 0;
@@ -1294,7 +1302,7 @@ static int Pdr2_ManPredictParent( Pdr2_Man_t * p, int Frame, Vec_Int_t * vCube )
         if ( Pdr2_LitsAreInit(p, vTry) ) break;
         Pdr2_ManSortByAct( p, vTry, 0 );
         p->nPredictQueries++;
-        Ret = Pdr2_ManTryDrop( p, pSat, vTry, 1, NULL );
+        Ret = Pdr2_ManTryDrop( p, pSat, vTry, 1, NULL, Pdr2_ManJftrReq(p, PDR2_JQ_MIC, PDR2_JFTR_PRED) );
         if ( Ret == -1 ) break;
         if ( Ret == 1 )
         {
@@ -1310,6 +1318,8 @@ static int Pdr2_ManPredictParent( Pdr2_Man_t * p, int Frame, Vec_Int_t * vCube )
         }
         Best = -1;
         Act = -1.0;
+        // a heuristic choice of the literal to add: any choice is sound, the candidate is used only after an UNSAT proof. On an early
+        // answer of the jftr mode a register input it left unassigned reads as unknown, i.e. not as a violated literal
         Vec_IntForEachEntry( vCube, Lit, i )
             if ( Vec_IntFind(vTry, Lit) == -1 &&
                  Gip_SolverLitValue(Pdr2_SolverActual(pSat), Pdr2_LitLi(p, Lit)) == GIP_FALSE &&
@@ -1367,7 +1377,7 @@ static void Pdr2_ManMicGroup( Pdr2_Man_t * p, int Frame, Vec_Int_t * vCube )
     {
         if ( Pdr2_LitsAreInit(p, vTry) ) break;
         p->nGroupQueries++;
-        Ret = Pdr2_ManTryDrop(p, pSat, vTry, 1, NULL);
+        Ret = Pdr2_ManTryDrop(p, pSat, vTry, 1, NULL, PDR2_JFTR_NONE);
         if ( Ret < 0 ) break;
         if ( Ret == 1 )
         {
@@ -1459,7 +1469,7 @@ static int Pdr2_ManMicHitModels( Pdr2_Man_t * p, Gip_Solver_t * pSat, Vec_Int_t 
         Vec_IntForEachEntry(vCube, Lit, i)
             if ( Hits.Best & (1u << i) ) Vec_IntPush(vTry, Lit);
         Trials++;
-        Ret = Pdr2_ManTryDrop(p, pSat, vTry, 0, vSource);
+        Ret = Pdr2_ManTryDrop(p, pSat, vTry, 0, vSource, PDR2_JFTR_NONE);
         if ( Ret < 0 ) break;
         if ( Ret == 1 )
         {
@@ -1526,7 +1536,7 @@ static void Pdr2_ManMicBatch( Pdr2_Man_t * p, int Frame, Vec_Int_t * vCube )
         if ( Vec_IntSize(vTry) && !Pdr2_LitsAreInit(p, vTry) )
         {
             Trials++;
-            Ret = Pdr2_ManTryDrop(p, pSat, vTry, 0, vSource);
+            Ret = Pdr2_ManTryDrop(p, pSat, vTry, 0, vSource, PDR2_JFTR_NONE);
             if ( Ret < 0 ) break;
             if ( Ret == 1 && Pdr2_ManInductiveCore(p, pSat, vCore) )
             {
@@ -1574,7 +1584,7 @@ static int Pdr2_ManJoinPush( Pdr2_Man_t * p, int Frame, Vec_Int_t * vCube, int *
     for ( k = 0; k < 5; ++k )
     {
         p->nJoinQueries++;
-        Ret = Pdr2_ManSolveRelative(p, pSat, vTry, 1, NULL);
+        Ret = Pdr2_ManSolveRelative(p, pSat, vTry, 1, NULL, PDR2_JFTR_NONE);
         if ( Ret < 0 ) break;
         if ( Ret == 1 )
         {
@@ -1600,7 +1610,7 @@ static int Pdr2_ManJoinPush( Pdr2_Man_t * p, int Frame, Vec_Int_t * vCube, int *
     {
         pSat = Pdr2_ManSolver(p, Frame - 1);
         p->nJoinQueries++;
-        if ( Pdr2_ManSolveRelative(p, pSat, vTry, 1, NULL) == 1 && Pdr2_ManInductiveCore(p, pSat, vCore) )
+        if ( Pdr2_ManSolveRelative(p, pSat, vTry, 1, NULL, PDR2_JFTR_NONE) == 1 && Pdr2_ManInductiveCore(p, pSat, vCore) )
         {
             p->nJoinLocal++;
             Result = 1;
@@ -1809,7 +1819,7 @@ static int Pdr2_ManGeneralize( Pdr2_Man_t * p, Pdr2_Obl_t * pObl )
             p->nInfPromoteCalls++;
             p->nPropInfCalls++;
             Pdr2_CubeToVec( pLem->pCube, vMic );
-            k = Pdr2_ManSolveRelative( p, p->pInf, vMic, 1, NULL );
+            k = Pdr2_ManSolveRelative( p, p->pInf, vMic, 1, NULL, Pdr2_ManJftrReq(p, PDR2_JQ_INF, PDR2_JFTR_PRED) );
             if ( k == 1 )
             {
                 if ( pLem->pObl )
@@ -1837,7 +1847,7 @@ static int Pdr2_ManGeneralize( Pdr2_Man_t * p, Pdr2_Obl_t * pObl )
 // A blocked prefix also blocks the full cube. A satisfiable prefix does not
 // supply a predecessor of the full cube, so retry the full query before lifting.
 // Excluding initial states is required when the prefix strengthens the query.
-static int Pdr2_ManSolveBlockedInt( Pdr2_Man_t * p, Gip_Solver_t * pSat, Vec_Int_t * vCube )
+static int Pdr2_ManSolveBlockedInt( Pdr2_Man_t * p, Gip_Solver_t * pSat, Vec_Int_t * vCube, int Jftr )
 {
     int i, RetValue = 0, nPrefix = p->pPars->nPrefix;
     if ( nPrefix && Vec_IntSize(vCube) >= 4 * nPrefix )
@@ -1848,7 +1858,7 @@ static int Pdr2_ManSolveBlockedInt( Pdr2_Man_t * p, Gip_Solver_t * pSat, Vec_Int
         if ( !Pdr2_LitsAreInit(p, vPrefix) )
         {
             p->nPrefixCalls++;
-            RetValue = Pdr2_ManSolveRelative( p, pSat, vPrefix, p->pPars->fBlockInduct, NULL );
+            RetValue = Pdr2_ManSolveRelative( p, pSat, vPrefix, p->pPars->fBlockInduct, NULL, Jftr );
             if ( RetValue == 1 )
             {
                 p->nPrefixProved++;
@@ -1859,7 +1869,7 @@ static int Pdr2_ManSolveBlockedInt( Pdr2_Man_t * p, Gip_Solver_t * pSat, Vec_Int
         if ( RetValue != 0 )
             return RetValue;
     }
-    return Pdr2_ManSolveRelative( p, pSat, vCube, p->pPars->fBlockInduct, NULL );
+    return Pdr2_ManSolveRelative( p, pSat, vCube, p->pPars->fBlockInduct, NULL, Jftr );
 }
 
 /**Function*************************************************************
@@ -1869,12 +1879,12 @@ static int Pdr2_ManSolveBlockedInt( Pdr2_Man_t * p, Gip_Solver_t * pSat, Vec_Int
   Description []
 
 ***********************************************************************/
-static int Pdr2_ManSolveBlocked( Pdr2_Man_t * p, Gip_Solver_t * pSat, Vec_Int_t * vCube )
+static int Pdr2_ManSolveBlocked( Pdr2_Man_t * p, Gip_Solver_t * pSat, Vec_Int_t * vCube, int Jftr )
 {
     int Result;
     assert(!p->fInputBlockQuery);
     p->fInputBlockQuery = 1;
-    Result = Pdr2_ManSolveBlockedInt(p, pSat, vCube);
+    Result = Pdr2_ManSolveBlockedInt(p, pSat, vCube, Jftr);
     p->fInputBlockQuery = 0;
     return Result;
 }
@@ -2009,7 +2019,7 @@ static int Pdr2_ManBlock( Pdr2_Man_t * p )
         clk = Abc_Clock();
         Pdr2_CubeToVec( pObl->pState, p->vLits4 );
         Pdr2_ManSortByAct( p, p->vLits4, 0 );
-        RetValue = Pdr2_ManSolveBlocked( p, Pdr2_ManSolver(p, pObl->iFrame - 1), p->vLits4 );
+        RetValue = Pdr2_ManSolveBlocked( p, Pdr2_ManSolver(p, pObl->iFrame - 1), p->vLits4, Pdr2_ManJftrReq(p, PDR2_JQ_BLOCK, PDR2_JFTR_PRED_SHRINK) );
         p->timeBlocked += Abc_Clock() - clk;
         if ( RetValue == -1 )
         {
@@ -2090,7 +2100,7 @@ static int Pdr2_ManBlockCtp( Pdr2_Man_t * p, int k, Vec_Int_t * vPred, Vec_Int_t
     if ( Pdr2_LitsAreInit(p, vPred) )
         return 0;
     Pdr2_ManSortByAct( p, vPred, 0 );
-    RetValue = Pdr2_ManSolveRelative( p, pSat, vPred, 1, NULL );
+    RetValue = Pdr2_ManSolveRelative( p, pSat, vPred, 1, NULL, Pdr2_ManJftrReq(p, PDR2_JQ_MIC, PDR2_JFTR_PRED) );
     if ( RetValue != 1 )
         return RetValue;
     if ( !Pdr2_ManInductiveCore( p, pSat, vCore ) )
@@ -2139,7 +2149,11 @@ static int Pdr2_ManPropagate( Pdr2_Man_t * p )
                 Pdr2_CubeToVec( pLem->pCube, p->vLits4 );
                 Pdr2_ManSortByAct( p, p->vLits4, 0 );
                 p->nPropCalls++;
-                RetValue = Pdr2_ManSolveRelative( p, Pdr2_ManSolver(p, k), p->vLits4, 0, NULL );
+                // the model of this query reaches the predecessor extraction of Pdr2_ManBlockCtp exactly when another
+                // attempt to block a counterexample to propagation follows, j < nCtpMax: the walk and the shrink are requested
+                // then, as for a block query, whose model is used the same way; the CTI cache reads the completion, which the
+                // shrink does not change
+                RetValue = Pdr2_ManSolveRelative( p, Pdr2_ManSolver(p, k), p->vLits4, 0, NULL, Pdr2_ManJftrReq(p, PDR2_JQ_PROP, j < p->pPars->nCtpMax ? PDR2_JFTR_PRED_SHRINK : PDR2_JFTR_ANSWER) );
                 if ( RetValue == -1 )
                 {
                     p->fSweepCut = 1;
@@ -2256,7 +2270,7 @@ static int Pdr2_ManPropInfRec( Pdr2_Man_t * p, Vec_Ptr_t * vLast, Vec_Int_t * vC
     {
         Pdr2_CubeToVec( pLem->pCube, vLits );
         p->nPropInfCalls++;
-        RetValue = Pdr2_ManSolveRelative( p, p->pInf, vLits, 1, NULL );
+        RetValue = Pdr2_ManSolveRelative( p, p->pInf, vLits, 1, NULL, Pdr2_ManJftrReq(p, PDR2_JQ_INF, PDR2_JFTR_PRED) );
         if ( RetValue == 1 )
         {
             if ( pLem->pObl )
@@ -2307,7 +2321,7 @@ static void Pdr2_ManPropagateToInf( Pdr2_Man_t * p )
         {
             Pdr2_CubeToVec( pLem->pCube, vLits );
             p->nPropInfCalls++;
-            RetValue = Pdr2_ManSolveRelative( p, p->pInf, vLits, 1, NULL );
+            RetValue = Pdr2_ManSolveRelative( p, p->pInf, vLits, 1, NULL, Pdr2_ManJftrReq(p, PDR2_JQ_INF, PDR2_JFTR_PRED) );
             if ( RetValue == 1 )
             {
                 if ( pLem->pObl )
@@ -3009,13 +3023,13 @@ static int Pdr2_ManBlockHint( Pdr2_Man_t * p, int iFrame, Vec_Int_t * vCube, int
 {
     Gip_Solver_t * pSat = Pdr2_ManSolver(p, iFrame - 1);
     int i, Lit;
-    if ( Pdr2_LitsAreInit(p, vCube) || Pdr2_ManTryDrop(p, pSat, vCube, 1, NULL) != 1 )
+    if ( Pdr2_LitsAreInit(p, vCube) || Pdr2_ManTryDrop(p, pSat, vCube, 1, NULL, PDR2_JFTR_NONE) != 1 )
         return 0;
     for ( i = Vec_IntSize(vCube) - 1; i >= 0 && Vec_IntSize(vCube) > 1 && !Pdr2_ManPastDeadline(p); i-- )
     {
         Lit = Vec_IntEntry(vCube, i);
         Vec_IntDrop(vCube, i);
-        if ( Pdr2_LitsAreInit(p, vCube) || Pdr2_ManTryDrop(p, pSat, vCube, 1, NULL) != 1 )
+        if ( Pdr2_LitsAreInit(p, vCube) || Pdr2_ManTryDrop(p, pSat, vCube, 1, NULL, PDR2_JFTR_NONE) != 1 )
             Vec_IntPushOrder(vCube, Lit);
     }
     *pfClosed = Pdr2_ManAddLemma(p, iFrame, vCube, 1, NULL, NULL);
@@ -7438,6 +7452,8 @@ init_runs:
                         (double)pMan[j]->timeLift / CLOCKS_PER_SEC, (double)pMan[j]->timeLiftSim / CLOCKS_PER_SEC, (double)pMan[j]->timeAbs / CLOCKS_PER_SEC );
         }
     }
+    if ( !pPars->fSilent && Gip_OptionGet("PDR2_JFTR_CHECK") )
+        Pdr2_ManPrintJftrChecks( pMan, 5 );
     for ( j = 0; j < 5; j++ )
         if ( pMan[j] )
         {

@@ -444,6 +444,20 @@ void Pdr2_ManSimWeaken( Pdr2_Man_t * p, Vec_Int_t * vCube, Vec_Int_t * vInputs )
     p->nLiftTrav++;
     Vec_IntForEachEntry( vVisit, Id, i )
         Pdr2_ManSimCone_rec( pAig, Aig_ManObj(pAig, Id), p->pLiftTrav, p->nLiftTrav, p->vLiftCone );
+    // after an early answer of the jftr mode, inputs of the simulated cone can be missing from vInputs: the answer leaves them free,
+    // and the simulation uses them with value 0. Once latches are made unknown below, a target may come to depend on such an input, so
+    // every unrecorded input of the cone becomes a premise with that value: the weakened cube implies the targets together with
+    // vInputs. A model of the plain search assigns the inputs of the cone, and nothing changes for it
+    if ( Pdr2_SolverActual(p->pLastSolver)->Jftr.fEarly )
+        Vec_IntForEachEntry( p->vLiftCone, Id, i )
+        {
+            pObj = Aig_ManObj( pAig, Id );
+            if ( Saig_ObjIsPi(pAig, pObj) && !pPi[Aig_ObjCioId(pObj)] )
+            {
+                Vec_IntPush( vInputs, Abc_Var2Lit(Aig_ObjCioId(pObj), 1) );
+                pPi[Aig_ObjCioId(pObj)] = 1;
+            }
+        }
     Pdr2_ManSimCone( p, pVals );
     if ( fBad )
         fOk = pVals[Aig_ObjId(Aig_ManCo(pAig, 0))] == PDR2_V1;
@@ -455,6 +469,14 @@ void Pdr2_ManSimWeaken( Pdr2_Man_t * p, Vec_Int_t * vCube, Vec_Int_t * vInputs )
     {
         // the simulation does not reproduce the model (should not happen): no weakening
         p->nLiftSimFail++;
+        if ( Pdr2_SolverActual(p->pLastSolver)->Jftr.nConf > 0 )   // the model came from a solve that used the jftr mode
+        {
+            // the state and inputs taken from the model do not produce the targets: with the jftr mode in use no cube is returned from here
+            Abc_Print( 1, "Pdr2_ManSimWeaken(): Internal error: the simulation of the model does not reach the targets.\n" );
+            fflush( stdout );
+            fprintf( stderr, "Pdr2_ManSimWeaken(): Internal error: the simulation of the model does not reach the targets.\n" );
+            abort();
+        }
         goto finish;
     }
     // justification from the targets: the fanins of a 1-node, one 0-fanin of a 0-node

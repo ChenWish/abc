@@ -1047,6 +1047,11 @@ void Pdr2_LemCacheCti( Pdr2_Man_t * p, Pdr2_Lem_t * pLem, Gip_Solver_t * pSat, i
         word * pVal  = p->pCtiVal  + (size_t)i * nStride + (Slot >> 6);
         word * pMask = p->pCtiMask + (size_t)i * nStride + (Slot >> 6);
         Value = pSat->pValue[p->pLoVar[i]];
+        // (an early answer) the answer stands for one state: a register of the domain it left unassigned has the value of the solver's
+        // register completion. The cached counterexample is then that state, as the cached state of a plain answer has every register
+        // of the domain.
+        if ( Value == GIP_NONE && pSat->Jftr.fEarly && Gip_DomainHas(&pSat->Domain, p->pLoVar[i]) )
+            Value = Gip_SolverCoverValue( pSat, p->pLoVar[i] );
         if ( Value == GIP_NONE )
         {
             *pMask &= ~Bit;
@@ -1526,7 +1531,7 @@ int Pdr2_ManVerifyInvariant( Pdr2_Man_t * p )
     Vec_PtrForEachEntry( Pdr2_Cube_t *, vInv, pCube, i )
     {
         Pdr2_CubeToVec( pCube, p->vLits4 );
-        RetValue = Pdr2_ManSolveRelative( p, pSat, p->vLits4, 0, NULL );
+        RetValue = Pdr2_ManSolveRelative( p, pSat, p->vLits4, 0, NULL, PDR2_JFTR_NONE );
         if ( RetValue == -1 )
         {
             if ( !p->pPars->fSilent )
@@ -1729,6 +1734,33 @@ void Pdr2_ManPrintProgress( Pdr2_Man_t * p, int fForce )
     Abc_Print( 1, "%6.2f sec\n", (double)(Abc_Clock() - p->timeStart) / CLOCKS_PER_SEC );
     fflush( stdout );
 }
+// the debug checks of the jftr mode (PDR2_JFTR_CHECK): one summary line for the run (the solvers of all its managers). A failed
+// check stops the run with an internal error before this point, so a printed summary has no failure.
+void Pdr2_ManPrintJftrChecks( Pdr2_Man_t ** pMan, int nMan )
+{
+    Gip_JftrVer_t Sum;
+    Gip_Solver_t * pSat;
+    int j, k, Level = 0;
+    memset( &Sum, 0, sizeof(Gip_JftrVer_t) );
+    for ( j = 0; j < nMan; j++ )
+    {
+        if ( pMan[j] == NULL )
+            continue;
+        for ( k = -2; k < Vec_PtrSize(pMan[j]->vSolvers); k++ )
+        {
+            pSat = k == -2 ? pMan[j]->pInf : k == -1 ? pMan[j]->pLift : (Gip_Solver_t *)Vec_PtrEntry( pMan[j]->vSolvers, k );
+            Level = Abc_MaxInt( Level, pSat->Jftr.fVerify );
+            Sum.nEarly += pSat->Jftr.Ver.nEarly;  Sum.nEarlyOut += pSat->Jftr.Ver.nEarlyOut;
+            Sum.nModel += pSat->Jftr.Ver.nModel;  Sum.nModelOut += pSat->Jftr.Ver.nModelOut;
+            Sum.nFlip  += pSat->Jftr.Ver.nFlip;   Sum.nCover    += pSat->Jftr.Ver.nCover;
+        }
+    }
+    if ( Level == 0 )
+        return;
+    Abc_Print( 1, "jftr checks (PDR2_JFTR_CHECK=%d): early answers %lld (assigned nodes open only outside the domain %lld), completions %lld (nodes not evaluated %lld), states after flip-to-none %lld, lemma clauses of complete covers %lld; failures 0.\n",
+        Level, (long long)Sum.nEarly, (long long)Sum.nEarlyOut, (long long)Sum.nModel, (long long)Sum.nModelOut, (long long)Sum.nFlip, (long long)Sum.nCover );
+}
+
 void Pdr2_ManPrintStats( Pdr2_Man_t * p )
 {
     abctime timeTotal = p->timeRun ? p->timeRun : Abc_Clock() - p->timeStart;
